@@ -29,8 +29,10 @@ env/
 # Recordings (large binary files)
 *.wav
 
-# One-off scripts
+# One-off scripts and generated files
 resummarize_sonnet.py
+slides_hackntell.py
+meetscribe_hackntell_*.pdf
 
 # OS
 .DS_Store
