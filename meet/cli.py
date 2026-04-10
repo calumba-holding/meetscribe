@@ -983,6 +983,13 @@ def translate(session_dir, target_lang, summary_model):
     help="Skip summary regeneration (use find-and-replace on existing summary)",
 )
 @click.option(
+    "--auto",
+    is_flag=True,
+    default=False,
+    help="Auto-label using voice profiles. Confident matches are applied "
+    "without prompting; unrecognized speakers are prompted interactively.",
+)
+@click.option(
     "--summary-backend",
     type=click.Choice(
         ["ollama", "openrouter", "claudemax", "openai"], case_sensitive=False
@@ -996,7 +1003,7 @@ def translate(session_dir, target_lang, summary_model):
     default=None,
     help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
 )
-def label(session_dir, no_audio, no_summary, summary_backend, summary_model):
+def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_model):
     """Assign real names to speakers in a transcribed session.
 
     \b
@@ -1006,6 +1013,10 @@ def label(session_dir, no_audio, no_summary, summary_backend, summary_model):
     (from the appropriate channel) and prompts you to enter a name.
     Press Enter to keep the current label unchanged.
 
+    With --auto, speaker voice profiles are used to automatically identify
+    known speakers. Confident matches are applied without prompting.
+    Unrecognized speakers are still prompted interactively.
+
     After labeling, all outputs (txt, srt, json, summary, pdf) are
     regenerated with the new speaker names.
 
@@ -1013,7 +1024,8 @@ def label(session_dir, no_audio, no_summary, summary_backend, summary_model):
     Examples:
         meet label ~/meet-recordings/meeting-20260313-214133
         meet label ~/meet-recordings/meeting-20260313-214133 --no-audio
-        meet label ~/meet-recordings/meeting-20260313-214133 --no-summary
+        meet label ~/meet-recordings/meeting-20260313-214133 --auto
+        meet label ~/meet-recordings/meeting-20260313-214133 --auto --no-summary
     """
     from meet.label import (
         get_speakers,
@@ -1021,6 +1033,8 @@ def label(session_dir, no_audio, no_summary, summary_backend, summary_model):
         play_clip,
         apply_labels,
         _find_session_files,
+        _load_transcript,
+        _detect_speaker_channels,
     )
 
     session_path = Path(session_dir)
@@ -1051,75 +1065,152 @@ def label(session_dir, no_audio, no_summary, summary_backend, summary_model):
     click.echo(f"Speakers found: {len(speakers)}")
     click.echo()
 
+    # ── Voice profile auto-identification ──
+    auto_matches: dict = {}
+    wav_path = files.get("wav")
+    channel_map: dict[str, str] = {}
+
+    if auto and wav_path and wav_path.exists():
+        click.echo("Running voice identification against speaker profiles...")
+        transcript = _load_transcript(files["json"])
+        channel_map = _detect_speaker_channels(
+            wav_path,
+            transcript.segments,
+            transcript.speakers,
+        )
+
+        try:
+            from meet.voiceprint import identify_speakers, load_profiles
+
+            profiles = load_profiles()
+            if not profiles:
+                click.echo("  No speaker profiles found. Run 'meet enroll' first.")
+                click.echo("  Falling back to interactive labeling.")
+                click.echo()
+            else:
+                click.echo(f"  {len(profiles)} voice profiles loaded.")
+                auto_matches = identify_speakers(
+                    wav_path,
+                    transcript.segments,
+                    transcript.speakers,
+                    channel_map,
+                )
+                if auto_matches:
+                    click.echo(
+                        f"  Identified {len(auto_matches)}/{len(speakers)} speakers:"
+                    )
+                    for spk_id, match in sorted(auto_matches.items()):
+                        click.echo(
+                            f"    {spk_id} -> {click.style(match.name, fg='green')}"
+                            f"  (confidence: {match.confidence:.2f})"
+                        )
+                else:
+                    click.echo("  No confident matches found.")
+                click.echo()
+        except Exception as exc:
+            click.echo(f"  Voice identification failed: {exc}", err=True)
+            click.echo("  Falling back to interactive labeling.")
+            click.echo()
+
     # Show summary table
     click.echo(
-        f"  {'#':<4} {'Label':<14} {'Channel':<10} {'Segments':<10} {'Sample Text'}"
+        f"  {'#':<4} {'Label':<14} {'Channel':<10} {'Segments':<10} {'Auto-ID':<20} {'Sample Text'}"
     )
-    click.echo(f"  {'─' * 4} {'─' * 14} {'─' * 10} {'─' * 10} {'─' * 40}")
+    click.echo(f"  {'─' * 4} {'─' * 14} {'─' * 10} {'─' * 10} {'─' * 20} {'─' * 40}")
     for i, sp in enumerate(speakers, 1):
+        auto_name = ""
+        if sp.id in auto_matches:
+            m = auto_matches[sp.id]
+            auto_name = f"{m.name} ({m.confidence:.0%})"
         click.echo(
-            f"  {i:<4} {sp.id:<14} {sp.channel:<10} {sp.segment_count:<10} {sp.sample_text[:40]}"
+            f"  {i:<4} {sp.id:<14} {sp.channel:<10} {sp.segment_count:<10} {auto_name:<20} {sp.sample_text[:40]}"
         )
     click.echo()
 
-    # Find WAV for audio playback
-    wav_path = files.get("wav")
+    # ── Build label map ──
     can_play = not no_audio and wav_path and wav_path.exists()
 
     if not can_play and not no_audio:
         click.echo("  (No WAV file found — skipping audio playback)")
         click.echo()
 
-    # Interactive labeling loop
     label_map: dict[str, str] = {}
     temp_clips: list[Path] = []
 
-    try:
-        for i, sp in enumerate(speakers, 1):
-            click.echo(f"Speaker {i}/{len(speakers)}: {click.style(sp.id, bold=True)}")
-            click.echo(f"  Channel: {sp.channel}  |  Segments: {sp.segment_count}")
-            click.echo(f'  Sample:  "{sp.sample_text}"')
+    # Separate speakers into auto-matched and unrecognized
+    auto_labeled = {sp.id for sp in speakers if sp.id in auto_matches}
+    unrecognized = [sp for sp in speakers if sp.id not in auto_matches]
 
-            # Play audio clip
-            if can_play:
-                try:
-                    clip_path = extract_speaker_clip(wav_path, sp)
-                    temp_clips.append(clip_path)
-                    click.echo(f"  Playing audio clip... ", nl=False)
-                    proc = play_clip(clip_path)
-                    proc.wait()
-                    click.echo("done")
-                except Exception as exc:
-                    click.echo(f"  (Audio playback failed: {exc})")
+    # Apply auto-matched labels directly
+    if auto and auto_matches:
+        click.echo("Auto-applying confident voice matches:")
+        for sp in speakers:
+            if sp.id in auto_matches:
+                match = auto_matches[sp.id]
+                label_map[sp.id] = match.name
+                click.echo(
+                    f"  {sp.id} -> {click.style(match.name, fg='green')}  ({match.confidence:.0%})"
+                )
+        click.echo()
 
-            # Prompt for name
-            new_name = click.prompt(
-                f"  Enter name for {sp.id} (Enter to keep)",
-                default="",
-                show_default=False,
-            ).strip()
+    # Interactive labeling for unrecognized speakers (or all speakers if not --auto)
+    speakers_to_prompt = unrecognized if auto else speakers
 
-            if new_name and new_name != sp.id:
-                label_map[sp.id] = new_name
-                click.echo(f"  {sp.id} -> {click.style(new_name, fg='green')}")
-            else:
-                click.echo(f"  Keeping: {sp.id}")
+    if speakers_to_prompt:
+        if auto and unrecognized:
+            click.echo(
+                f"{len(unrecognized)} unrecognized speaker(s) — prompting interactively:"
+            )
             click.echo()
 
-    finally:
-        # Clean up temp clips
-        for clip in temp_clips:
-            try:
-                clip.unlink(missing_ok=True)
-            except Exception:
-                pass
+        try:
+            for i, sp in enumerate(speakers_to_prompt, 1):
+                click.echo(
+                    f"Speaker {i}/{len(speakers_to_prompt)}: {click.style(sp.id, bold=True)}"
+                )
+                click.echo(f"  Channel: {sp.channel}  |  Segments: {sp.segment_count}")
+                click.echo(f'  Sample:  "{sp.sample_text}"')
+
+                # Play audio clip
+                if can_play:
+                    try:
+                        clip_path = extract_speaker_clip(wav_path, sp)
+                        temp_clips.append(clip_path)
+                        click.echo(f"  Playing audio clip... ", nl=False)
+                        proc = play_clip(clip_path)
+                        proc.wait()
+                        click.echo("done")
+                    except Exception as exc:
+                        click.echo(f"  (Audio playback failed: {exc})")
+
+                # Prompt for name
+                new_name = click.prompt(
+                    f"  Enter name for {sp.id} (Enter to keep)",
+                    default="",
+                    show_default=False,
+                ).strip()
+
+                if new_name and new_name != sp.id:
+                    label_map[sp.id] = new_name
+                    click.echo(f"  {sp.id} -> {click.style(new_name, fg='green')}")
+                else:
+                    click.echo(f"  Keeping: {sp.id}")
+                click.echo()
+
+        finally:
+            # Clean up temp clips
+            for clip in temp_clips:
+                try:
+                    clip.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     if not label_map:
         click.echo("No labels changed. Nothing to do.")
         return
 
     click.echo("Applying labels:")
-    for old, new in label_map.items():
+    for old, new in sorted(label_map.items()):
         click.echo(f"  {old} -> {new}")
     click.echo()
 
@@ -1139,6 +1230,31 @@ def label(session_dir, no_audio, no_summary, summary_backend, summary_model):
     click.echo("Updated files:")
     for fmt, path in result_files.items():
         click.echo(f"  {fmt}: {path}")
+
+    # ── Update voice profiles with confirmed labels ──
+    if auto and label_map:
+        click.echo()
+        click.echo("Updating voice profiles with confirmed labels...")
+        try:
+            from meet.voiceprint import update_profiles_from_confirmed_labels
+
+            transcript = _load_transcript(files["json"])
+            # Rebuild channel_map if not already done
+            if not channel_map:
+                channel_map = _detect_speaker_channels(
+                    wav_path,
+                    transcript.segments,
+                    transcript.speakers,
+                )
+            update_profiles_from_confirmed_labels(
+                wav_path,
+                transcript.segments,
+                label_map,
+                channel_map,
+            )
+            click.echo("  Voice profiles updated.")
+        except Exception as exc:
+            click.echo(f"  Profile update failed: {exc}", err=True)
 
 
 @main.command()

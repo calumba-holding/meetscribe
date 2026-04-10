@@ -129,6 +129,16 @@ _CSS = b"""
     color: #e67e22;
     font-weight: bold;
 }
+.status-confirming {
+    font-size: 13px;
+    color: #3498db;
+    font-weight: bold;
+}
+.status-syncing {
+    font-size: 13px;
+    color: #3498db;
+    font-weight: bold;
+}
 .status-done {
     font-size: 13px;
     color: #2ecc71;
@@ -175,6 +185,8 @@ class _State:
     DOWNLOADING_MODEL = "downloading_model"
     LABELING_SPEAKERS = "labeling_speakers"
     SUMMARIZING = "summarizing"
+    CONFIRMING_SYNC = "confirming_sync"
+    SYNCING = "syncing"
     DONE = "done"
     ERROR = "error"
 
@@ -215,6 +227,10 @@ class MeetRecorderWindow(Gtk.Window):
         self._label_auto_matches: dict = {}  # speaker_id -> SpeakerMatch, set by worker
         self._label_channel_map: dict = {}   # speaker_id -> 'mic'|'system', set by worker
         self._label_audio_path: Path | None = None  # audio file for profile update
+
+        # Threading synchronization for sync confirmation
+        self._sync_event = threading.Event()
+        self._sync_confirmed: bool = False  # True = Push, False = Skip
 
         # Window properties
         self.set_default_size(300, 150)
@@ -337,6 +353,32 @@ class MeetRecorderWindow(Gtk.Window):
         self._label_box.pack_start(label_btn_box, False, False, 0)
         vbox.pack_start(self._label_box, False, False, 4)
 
+        # Sync confirmation prompt (shown when a Blink meeting is detected)
+        self._sync_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._sync_box.set_halign(Gtk.Align.CENTER)
+
+        self._sync_label = Gtk.Label()
+        self._sync_label.set_line_wrap(True)
+        self._sync_label.set_max_width_chars(35)
+        self._sync_label.get_style_context().add_class("status-label")
+        self._sync_box.pack_start(self._sync_label, False, False, 0)
+
+        sync_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        sync_btn_box.set_halign(Gtk.Align.CENTER)
+
+        self._sync_push_btn = Gtk.Button(label="Push to blink-wip")
+        self._sync_push_btn.get_style_context().add_class("record-btn")
+        self._sync_push_btn.connect("clicked", self._on_sync_push)
+        sync_btn_box.pack_start(self._sync_push_btn, False, False, 0)
+
+        self._sync_skip_btn = Gtk.Button(label="Skip")
+        self._sync_skip_btn.get_style_context().add_class("action-btn")
+        self._sync_skip_btn.connect("clicked", self._on_sync_skip)
+        sync_btn_box.pack_start(self._sync_skip_btn, False, False, 0)
+
+        self._sync_box.pack_start(sync_btn_box, False, False, 0)
+        vbox.pack_start(self._sync_box, False, False, 4)
+
         # Download progress bar (pulsing, shown during model downloads)
         self._progress_bar = Gtk.ProgressBar()
         self._progress_bar.set_pulse_step(0.05)
@@ -416,6 +458,22 @@ class MeetRecorderWindow(Gtk.Window):
         self.resize(300, 150)
         self.set_resizable(False)
         self._label_event.set()
+
+    def _on_sync_push(self, _widget):
+        """User confirmed pushing to blink-wip."""
+        self._sync_confirmed = True
+        self._sync_box.hide()
+        self.resize(300, 150)
+        self.set_resizable(False)
+        self._sync_event.set()
+
+    def _on_sync_skip(self, _widget):
+        """User chose to skip the blink-wip sync."""
+        self._sync_confirmed = False
+        self._sync_box.hide()
+        self.resize(300, 150)
+        self.set_resizable(False)
+        self._sync_event.set()
 
     def _on_label_play(self, _widget, clip_path):
         """Play a speaker audio clip."""
@@ -864,17 +922,46 @@ class MeetRecorderWindow(Gtk.Window):
             self._last_pdf = result["pdf"]
 
     def _do_sync(self, output: Path) -> None:
-        """If this is a scheduled meeting and sync is configured, push artifacts."""
+        """Check if this is a Blink meeting, prompt for confirmation, then push."""
         try:
-            from meet.sync import maybe_sync_session
-            maybe_sync_session(
+            from meet.sync import check_sync_candidate, sync_session, is_sync_configured
+            if not is_sync_configured():
+                return
+
+            candidate = check_sync_candidate(output.parent)
+            if candidate is None:
+                return
+
+            # Show confirmation prompt
+            from meet.sync import _date_from_session
+            date_str = _date_from_session(output.parent)
+            self._sync_event.clear()
+            self._sync_confirmed = False
+
+            def _show_sync_prompt(_c=candidate, _d=date_str):
+                self._sync_label.set_text(
+                    f"Push to blink-wip?\n{_c.match.name} · {_d}"
+                )
+                self._set_state(_State.CONFIRMING_SYNC)
+
+            GLib.idle_add(_show_sync_prompt)
+            self._sync_event.wait()
+
+            if not self._sync_confirmed:
+                return
+
+            # User confirmed — push
+            GLib.idle_add(self._set_state, _State.SYNCING)
+            sync_session(
                 output.parent,
+                candidate.match,
                 progress_callback=lambda msg: GLib.idle_add(
                     self._status_label.set_text, msg
                 ),
             )
-        except Exception:
-            pass  # sync is best-effort — never fail the main pipeline
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("Sync failed: %s", exc)
 
     # ── State management ────────────────────────────────────────────────
 
@@ -892,6 +979,7 @@ class MeetRecorderWindow(Gtk.Window):
                      "status-transcribing", "status-summarizing",
                      "status-preparing", "status-downloading",
                      "status-awaiting", "status-labeling",
+                     "status-confirming", "status-syncing",
                      "status-done", "status-error"):
             sctx.remove_class(cls)
 
@@ -903,6 +991,8 @@ class MeetRecorderWindow(Gtk.Window):
             self._alignment_box.hide()
         if state != _State.LABELING_SPEAKERS:
             self._label_box.hide()
+        if state != _State.CONFIRMING_SYNC:
+            self._sync_box.hide()
         if state != _State.DOWNLOADING_MODEL:
             self._progress_bar.hide()
 
@@ -981,6 +1071,23 @@ class MeetRecorderWindow(Gtk.Window):
             self._label_box.show_all()
             self.set_resizable(True)
             self.resize(340, 350)
+
+        elif state == _State.CONFIRMING_SYNC:
+            self._button.set_label("■ Stop")
+            ctx.add_class("disabled-btn")
+            self._button.set_sensitive(False)
+            self._status_label.set_text("Blink meeting detected")
+            sctx.add_class("status-confirming")
+            self._sync_box.show_all()
+            self.set_resizable(True)
+            self.resize(300, 240)
+
+        elif state == _State.SYNCING:
+            self._button.set_label("■ Stop")
+            ctx.add_class("disabled-btn")
+            self._button.set_sensitive(False)
+            self._status_label.set_text("Pushing to blink-wip...")
+            sctx.add_class("status-syncing")
 
         elif state == _State.DONE:
             self._button.set_label("● Record")
@@ -1110,6 +1217,7 @@ def launch(
     # Hide widgets that should only appear on demand
     win._alignment_box.hide()
     win._label_box.hide()
+    win._sync_box.hide()
     win._progress_bar.hide()
     win._open_transcript_btn.hide()
     win._open_folder_btn.hide()

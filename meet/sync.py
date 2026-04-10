@@ -110,6 +110,58 @@ class MeetingMatch:
     folder: str
 
 
+@dataclass
+class SyncCandidate:
+    """A meeting that passed schedule + team-member checks and is ready to sync."""
+    match: MeetingMatch
+    team_members_found: list[str]  # names of recognized team members in this meeting
+
+
+def check_sync_candidate(session_dir: Path) -> SyncCandidate | None:
+    """Check whether a session should be offered for sync.
+
+    Passes two gates:
+    1. Schedule match (day + time window)
+    2. At least min_team_members recognized Blink team members are present
+
+    Returns a SyncCandidate if both pass, None otherwise.
+    """
+    match = detect_meeting_type(session_dir)
+    if match is None:
+        return None
+
+    config = load_sync_config()
+    team_members = {m.lower() for m in config.get("team_members", [])}
+    min_required = config.get("min_team_members", 2)
+
+    if not team_members:
+        # No team list configured — fall back to schedule-only check
+        return SyncCandidate(match=match, team_members_found=[])
+
+    # Read confirmed speaker labels from session.json
+    session_json = _find_session_json(session_dir)
+    if not session_json:
+        return None
+
+    try:
+        meta = json.loads(session_json.read_text(encoding="utf-8"))
+        labels = meta.get("speaker_labels", {})
+        # labels values are the human names
+        confirmed_names = list(labels.values())
+    except Exception:
+        return None
+
+    found = [n for n in confirmed_names if n.lower() in team_members]
+    if len(found) < min_required:
+        log.debug(
+            "Skipping sync for %s: only %d/%d team members found (%s)",
+            session_dir.name, len(found), min_required, found,
+        )
+        return None
+
+    return SyncCandidate(match=match, team_members_found=found)
+
+
 def detect_meeting_type(session_dir: Path) -> MeetingMatch | None:
     """Check if a session matches any configured scheduled meeting.
 
@@ -397,29 +449,29 @@ def maybe_sync_session(
     session_dir: Path,
     progress_callback=None,
 ) -> MeetingMatch | None:
-    """Detect meeting type and sync if it matches a scheduled meeting.
+    """Detect, validate (team members), and sync a Blink meeting.
 
-    This is the main entry point called from the GUI pipeline.
-    If sync is not configured (no repo_url), silently returns None.
+    Used by the CLI `meet sync` command. The GUI uses check_sync_candidate +
+    sync_session directly so it can interpose a confirmation dialog in between.
 
-    Returns the MeetingMatch if synced, None if not a scheduled meeting.
+    Returns the MeetingMatch if synced, None if skipped.
     """
     if not is_sync_configured():
         return None
 
-    match = detect_meeting_type(session_dir)
-    if match is None:
+    candidate = check_sync_candidate(session_dir)
+    if candidate is None:
         return None
 
     def _log(msg: str) -> None:
         if progress_callback:
             progress_callback(msg)
 
-    _log(f"Scheduled meeting detected: {match.name} — syncing...")
+    _log(f"Blink meeting detected: {candidate.match.name} — syncing...")
     try:
-        sync_session(session_dir, match, progress_callback=progress_callback)
+        sync_session(session_dir, candidate.match, progress_callback=progress_callback)
     except Exception as exc:
         _log(f"Sync failed (meeting saved locally): {exc}")
         log.exception("Sync failed for %s", session_dir)
 
-    return match
+    return candidate.match
