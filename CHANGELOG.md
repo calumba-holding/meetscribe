@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.4.0 — 2026-04-13
+
+### New features
+
+- **Background post-processing for back-to-back meetings** — after stopping a
+  recording, the GUI returns to idle within seconds (drain time) so you can
+  immediately start recording the next meeting. Transcription, speaker labeling,
+  summarization, PDF generation, and sync all run in a background job queue.
+  A small status line at the bottom of the window shows background progress
+  (e.g., "Transcribing: meeting-20260413-143453..."). Interactive dialogs
+  (speaker labeling, alignment model prompts, sync confirmation) are deferred
+  until the user is not actively recording.
+
+### Improvements
+
+- Simplified GUI state machine: removed 8 post-processing states that blocked
+  the recording controls. Primary states are now: idle, recording, paused,
+  draining, done, error.
+- Background jobs process sequentially via a FIFO queue, ensuring GPU resources
+  are not contended between concurrent transcriptions.
+- Clean shutdown: closing the window unblocks any background threads waiting
+  for user input.
+
+### Testing
+
+- All 100 tests pass (99 + 1 pre-existing environment-dependent skip).
+
+---
+
 ## v0.3.3 — 2026-04-13
 
 ### New features

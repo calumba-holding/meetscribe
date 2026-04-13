@@ -164,7 +164,7 @@ def _recording_loop(session) -> None:
 
 
 @click.group()
-@click.version_option(version="0.3.3")
+@click.version_option(version="0.4.0")
 def main():
     """Local meeting transcription with speaker diarization."""
     pass

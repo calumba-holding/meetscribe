@@ -9,6 +9,7 @@ Window layout (~300x180px):
     │     Ready                    │
     │        [ ● Record ]          │
     │   Open Transcript  Open Folder│
+    │  Processing: meeting-...     │
     └──────────────────────────────┘
 
     Recording:
@@ -17,6 +18,7 @@ Window layout (~300x180px):
     │     00:07:23    14.2 MB      │
     │     Recording...             │
     │  [ ⏸ Pause ]  [ ■ Stop ]    │
+    │  Processing: meeting-...     │
     └──────────────────────────────┘
 
     Paused:
@@ -25,22 +27,29 @@ Window layout (~300x180px):
     │     00:07:23    14.2 MB      │
     │     Paused                   │
     │  [ ▶ Resume ]  [ ■ Stop ]   │
+    │  Processing: meeting-...     │
     └──────────────────────────────┘
 
-States:
+Primary states (control recording):
     idle        → "Ready", green Record button
     recording   → "Recording...", Pause + Stop buttons, timer ticking
     paused      → "Paused", Resume + Stop buttons, timer frozen
     draining    → "Flushing buffer... Xs", buttons disabled
-    transcribing → "Transcribing...", buttons disabled
     done        → "Done — transcript saved", green Record button
+    error       → error message, green Record button
 
-The recording session runs in a background thread. UI updates are
-dispatched via GLib.timeout_add (every 500ms poll).
+Post-processing (transcription, summarization, labeling, sync) runs in a
+background job queue.  After drain+stop the GUI returns to idle immediately
+so the user can start a new recording.  Background progress is shown in a
+small secondary status label at the bottom of the window.  Interactive
+dialogs (alignment model prompt, speaker labeling, sync confirmation) are
+deferred until the user is not actively recording.
 """
 
 from __future__ import annotations
 
+import logging
+import queue
 import signal
 import subprocess
 import threading
@@ -54,6 +63,8 @@ from gi.repository import Gtk, GLib, Gdk, Pango  # noqa: E402
 
 from meet.capture import DRAIN_SECONDS
 from meet.utils import fmt_elapsed, fmt_size
+
+_log = logging.getLogger(__name__)
 
 
 # ─── CSS ────────────────────────────────────────────────────────────────────
@@ -133,46 +144,6 @@ _CSS = b"""
     color: #f39c12;
     font-weight: bold;
 }
-.status-transcribing {
-    font-size: 13px;
-    color: #3498db;
-    font-weight: bold;
-}
-.status-preparing {
-    font-size: 13px;
-    color: #f39c12;
-    font-weight: bold;
-}
-.status-downloading {
-    font-size: 13px;
-    color: #e67e22;
-    font-weight: bold;
-}
-.status-awaiting {
-    font-size: 13px;
-    color: #e67e22;
-    font-weight: bold;
-}
-.status-summarizing {
-    font-size: 13px;
-    color: #9b59b6;
-    font-weight: bold;
-}
-.status-labeling {
-    font-size: 13px;
-    color: #e67e22;
-    font-weight: bold;
-}
-.status-confirming {
-    font-size: 13px;
-    color: #3498db;
-    font-weight: bold;
-}
-.status-syncing {
-    font-size: 13px;
-    color: #3498db;
-    font-weight: bold;
-}
 .status-done {
     font-size: 13px;
     color: #2ecc71;
@@ -182,6 +153,10 @@ _CSS = b"""
     font-size: 13px;
     color: #e74c3c;
     font-weight: bold;
+}
+.bg-status-label {
+    font-size: 11px;
+    color: #95a5a6;
 }
 .action-btn {
     background: transparent;
@@ -207,7 +182,7 @@ progressbar progress {
 """
 
 
-# ─── State enum ─────────────────────────────────────────────────────────────
+# ─── State enum (primary states only) ──────────────────────────────────────
 
 
 class _State:
@@ -215,14 +190,6 @@ class _State:
     RECORDING = "recording"
     PAUSED = "paused"
     DRAINING = "draining"
-    PREPARING_GPU = "preparing_gpu"
-    TRANSCRIBING = "transcribing"
-    AWAITING_ALIGNMENT = "awaiting_alignment"
-    DOWNLOADING_MODEL = "downloading_model"
-    LABELING_SPEAKERS = "labeling_speakers"
-    SUMMARIZING = "summarizing"
-    CONFIRMING_SYNC = "confirming_sync"
-    SYNCING = "syncing"
     DONE = "done"
     ERROR = "error"
 
@@ -253,6 +220,11 @@ class MeetRecorderWindow(Gtk.Window):
         self._last_output: Path | None = None
         self._last_pdf: Path | None = None
         self._error_msg: str | None = None
+        self._destroying = False
+
+        # Background post-processing job queue
+        self._job_queue: queue.Queue[Path] = queue.Queue()
+        self._job_thread: threading.Thread | None = None
 
         # Threading synchronization for alignment model prompt
         self._alignment_event = threading.Event()
@@ -445,6 +417,14 @@ class MeetRecorderWindow(Gtk.Window):
         self._progress_bar.set_pulse_step(0.05)
         vbox.pack_start(self._progress_bar, False, False, 2)
 
+        # Background job status label (small muted text at the bottom)
+        self._bg_label = Gtk.Label()
+        self._bg_label.set_line_wrap(True)
+        self._bg_label.set_max_width_chars(40)
+        self._bg_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self._bg_label.get_style_context().add_class("bg-status-label")
+        vbox.pack_start(self._bg_label, False, False, 0)
+
         self.add(vbox)
         self.connect("destroy", self._on_destroy)
 
@@ -515,9 +495,7 @@ class MeetRecorderWindow(Gtk.Window):
 
         # Update voice profiles in background with confirmed labels
         if self._label_result and self._label_audio_path:
-            import threading as _threading
-
-            _threading.Thread(
+            threading.Thread(
                 target=self._update_voice_profiles,
                 args=(self._label_result,),
                 daemon=True,
@@ -590,9 +568,7 @@ class MeetRecorderWindow(Gtk.Window):
                 self._label_channel_map,
             )
         except Exception as exc:
-            import logging
-
-            logging.getLogger(__name__).warning("Voice profile update failed: %s", exc)
+            _log.warning("Voice profile update failed: %s", exc)
 
     def _build_label_rows(self, speakers, wav_path, auto_matches=None):
         """Build the per-speaker label rows in the GTK label dialog.
@@ -656,42 +632,53 @@ class MeetRecorderWindow(Gtk.Window):
 
         self._label_box.show_all()
 
-    def _attempt_download(self, lang: str, config) -> bool:
+    def _attempt_download(self, lang: str, config, session_name: str) -> bool:
         """Download alignment model with retry prompt on failure.
 
-        Called from the worker thread.  On network errors the user is
-        shown a Retry / Skip Alignment prompt and can keep retrying
-        indefinitely.
+        Called from the background job thread.  Waits for the user to not
+        be recording before showing interactive prompts.
 
         Returns True when ready to proceed (model downloaded or user
-        chose to skip alignment).  Returns False if the prompt was
-        cancelled unexpectedly (caller should abort).
+        chose to skip alignment).  Returns False if cancelled.
         """
         from meet.transcribe import download_alignment_model
 
         while True:
-            GLib.idle_add(self._set_state, _State.DOWNLOADING_MODEL)
+            GLib.idle_add(self._set_bg_status, f"{session_name}: downloading model...")
+            GLib.idle_add(self._progress_bar.show)
             try:
                 download_alignment_model(
                     lang,
                     progress_callback=lambda msg: GLib.idle_add(
-                        self._status_label.set_text, msg
+                        self._set_bg_status, f"{session_name}: {msg}"
                     ),
                 )
+                GLib.idle_add(self._progress_bar.hide)
                 return True  # download succeeded
             except Exception as dl_exc:
+                GLib.idle_add(self._progress_bar.hide)
+
+                if self._destroying:
+                    return False
+
+                # Wait until user is not recording before showing prompt
+                self._wait_until_not_recording()
+                if self._destroying:
+                    return False
+
                 # Show retry / skip prompt
                 self._alignment_event.clear()
                 self._alignment_choice = None
                 err_text = str(dl_exc)
-                # Truncate very long exception messages
                 if len(err_text) > 120:
                     err_text = err_text[:117] + "..."
 
                 def _show_retry(msg=err_text):
                     self._alignment_label.set_text(f"Download failed:\n{msg}")
                     self._download_btn.set_label("Retry")
-                    self._set_state(_State.AWAITING_ALIGNMENT)
+                    self._alignment_box.show_all()
+                    self.set_resizable(True)
+                    self.resize(300, 280)
 
                 GLib.idle_add(_show_retry)
                 self._alignment_event.wait()
@@ -719,8 +706,6 @@ class MeetRecorderWindow(Gtk.Window):
 
         self._session = create_session(**self._capture_kwargs)
         self._session.start()
-        self._last_output = None
-        self._last_pdf = None
         self._error_msg = None
         self._set_state(_State.RECORDING)
 
@@ -743,39 +728,39 @@ class MeetRecorderWindow(Gtk.Window):
                 self._set_error(f"Resume failed: {exc}")
 
     def _stop_recording(self):
-        """Start the drain + stop + transcribe pipeline in a background thread."""
+        """Start drain + stop, then enqueue post-processing as a background job."""
         was_paused = self._state == _State.PAUSED
         self._set_state(_State.DRAINING)
         self._drain_remaining = DRAIN_SECONDS
         self._worker_thread = threading.Thread(
-            target=self._drain_stop_transcribe,
+            target=self._drain_and_enqueue,
             args=(was_paused,),
             daemon=True,
         )
         self._worker_thread.start()
 
-    def _drain_stop_transcribe(self, was_paused: bool = False):
-        """Background thread: drain buffer, stop recording, transcribe, summarize, generate PDF."""
+    def _drain_and_enqueue(self, was_paused: bool = False):
+        """Phase 1: Drain buffer, stop recording, enqueue for background processing.
+
+        After the WAV is saved, the GUI returns to IDLE immediately so the
+        user can start a new recording.
+        """
         if was_paused:
-            # No active ffmpeg to drain — skip directly to stop + transcribe
             output = self._do_stop_only()
         else:
             output = self._do_drain()
+
         if output is None:
+            # Error already shown via _set_error
+            GLib.idle_add(self._set_state, _State.IDLE)
             return
 
-        config, transcript = self._do_transcribe(output)
-        if transcript is None:
-            return
+        # Enqueue for background post-processing
+        self._job_queue.put(output)
+        self._ensure_job_thread()
 
-        transcript = self._do_label_speakers(output, transcript)
-
-        # Save transcript (or re-save with updated labels)
-        transcript.save(output.parent, basename=output.stem)
-
-        self._do_post_process(output, transcript)
-        self._do_sync(output)
-        GLib.idle_add(self._set_state, _State.DONE)
+        # Return to IDLE — user can immediately start a new recording
+        GLib.idle_add(self._set_state, _State.IDLE)
 
     def _do_drain(self):
         """Drain the recording buffer, stop capture, and return the output path.
@@ -794,7 +779,6 @@ class MeetRecorderWindow(Gtk.Window):
             GLib.idle_add(self._set_error, "No audio was recorded")
             return None
 
-        self._last_output = output
         return output
 
     def _do_stop_only(self):
@@ -809,11 +793,85 @@ class MeetRecorderWindow(Gtk.Window):
             GLib.idle_add(self._set_error, "No audio was recorded")
             return None
 
-        self._last_output = output
         return output
 
-    def _do_transcribe(self, output):
-        """Prepare GPU, check alignment model, and run transcription.
+    # ── Background post-processing queue ────────────────────────────────
+
+    def _ensure_job_thread(self):
+        """Start the job consumer thread if it's not already running."""
+        if self._job_thread is None or not self._job_thread.is_alive():
+            self._job_thread = threading.Thread(
+                target=self._job_consumer,
+                name="meet-bg-jobs",
+                daemon=True,
+            )
+            self._job_thread.start()
+
+    def _job_consumer(self):
+        """Long-lived thread that processes post-recording jobs sequentially."""
+        while not self._destroying:
+            try:
+                output = self._job_queue.get(timeout=1.0)
+            except queue.Empty:
+                # No more jobs — exit the thread (will be restarted if needed)
+                return
+
+            session_name = output.parent.name
+            try:
+                self._process_recording(output, session_name)
+            except Exception as exc:
+                _log.exception("Background processing failed for %s", session_name)
+                GLib.idle_add(self._set_bg_status, f"Error: {session_name}: {exc}")
+            finally:
+                self._job_queue.task_done()
+
+    def _wait_until_not_recording(self):
+        """Block the calling thread until the user is not actively recording.
+
+        Used by background jobs to defer interactive dialogs (alignment,
+        labeling, sync) until the user is free.
+        """
+        while self._state in (_State.RECORDING, _State.PAUSED, _State.DRAINING):
+            if self._destroying:
+                return
+            time.sleep(0.5)
+
+    def _process_recording(self, output: Path, session_name: str):
+        """Background pipeline: transcribe → label → summarize → PDF → sync.
+
+        Runs on the job consumer thread. Updates the secondary bg status
+        label. Defers interactive dialogs until user is not recording.
+        """
+        GLib.idle_add(self._set_bg_status, f"Transcribing: {session_name}...")
+
+        config, transcript = self._do_transcribe_bg(output, session_name)
+        if transcript is None:
+            return
+
+        transcript = self._do_label_speakers_bg(output, transcript, session_name)
+
+        # Save transcript (or re-save with updated labels)
+        transcript.save(output.parent, basename=output.stem)
+
+        pdf_path = self._do_post_process_bg(output, transcript, session_name)
+        self._do_sync_bg(output, session_name)
+
+        # Job complete — update results for "Open" buttons
+        def _on_job_done():
+            self._last_output = output
+            self._last_pdf = pdf_path
+            # If user is idle, transition to DONE with Open buttons
+            if self._state in (_State.IDLE, _State.DONE, _State.ERROR):
+                self._set_state(_State.DONE)
+                self._set_bg_status(None)
+            else:
+                # User is recording — show completion in bg label
+                self._set_bg_status(f"{session_name} ready")
+
+        GLib.idle_add(_on_job_done)
+
+    def _do_transcribe_bg(self, output: Path, session_name: str):
+        """Background-aware transcription with deferred interactive prompts.
 
         Returns (config, transcript) on success, or (None, None) on failure.
         """
@@ -831,17 +889,15 @@ class MeetRecorderWindow(Gtk.Window):
         config = TranscriptionConfig(**self._transcribe_kwargs)
         if not config.hf_token:
             GLib.idle_add(
-                self._set_error,
-                "HF_TOKEN not set — diarization won't work.\n"
-                "Add 'export HF_TOKEN=hf_...' to ~/.profile and re-login.",
+                self._set_bg_status, f"{session_name}: HF_TOKEN not set — skipping"
             )
             return None, None
 
         # ── Prepare GPU (unload Ollama) ──
-        GLib.idle_add(self._set_state, _State.PREPARING_GPU)
+        GLib.idle_add(self._set_bg_status, f"{session_name}: preparing GPU...")
         ensure_gpu_available(
             progress_callback=lambda msg: GLib.idle_add(
-                self._status_label.set_text, msg
+                self._set_bg_status, f"{session_name}: {msg}"
             )
         )
 
@@ -855,6 +911,16 @@ class MeetRecorderWindow(Gtk.Window):
                 size = _MODEL_SIZES.get(preflight_lang, "unknown size")
                 self._alignment_lang = lang_name
 
+                # Wait until user is not recording before showing prompt
+                if self._state in (_State.RECORDING, _State.PAUSED, _State.DRAINING):
+                    GLib.idle_add(
+                        self._set_bg_status,
+                        f"{session_name}: waiting (alignment model needed)...",
+                    )
+                self._wait_until_not_recording()
+                if self._destroying:
+                    return None, None
+
                 self._alignment_event.clear()
                 self._alignment_choice = None
 
@@ -862,23 +928,31 @@ class MeetRecorderWindow(Gtk.Window):
                     self._alignment_label.set_text(
                         f"Alignment model for {lang_name} not downloaded ({size})."
                     )
-                    self._set_state(_State.AWAITING_ALIGNMENT)
+                    self._alignment_box.show_all()
+                    self.set_resizable(True)
+                    self.resize(300, 280)
 
                 GLib.idle_add(_show_preflight_prompt)
                 self._alignment_event.wait()
 
                 if self._alignment_choice == "download":
-                    if not self._attempt_download(preflight_lang, config):
-                        GLib.idle_add(self._set_error, "Download cancelled")
+                    if not self._attempt_download(preflight_lang, config, session_name):
+                        GLib.idle_add(
+                            self._set_bg_status,
+                            f"{session_name}: alignment download cancelled",
+                        )
                         return None, None
                 elif self._alignment_choice == "skip":
                     config.skip_alignment = True
                 else:
-                    GLib.idle_add(self._set_error, "Alignment model prompt cancelled")
+                    GLib.idle_add(
+                        self._set_bg_status,
+                        f"{session_name}: alignment prompt cancelled",
+                    )
                     return None, None
 
         # ── Transcribe (with alignment model handling) ──
-        GLib.idle_add(self._set_state, _State.TRANSCRIBING)
+        GLib.idle_add(self._set_bg_status, f"Transcribing: {session_name}...")
         transcript = None
 
         try:
@@ -888,6 +962,16 @@ class MeetRecorderWindow(Gtk.Window):
             size = _MODEL_SIZES.get(exc.lang, "unknown size")
             self._alignment_lang = lang_name
 
+            # Wait until user is not recording before showing prompt
+            if self._state in (_State.RECORDING, _State.PAUSED, _State.DRAINING):
+                GLib.idle_add(
+                    self._set_bg_status,
+                    f"{session_name}: waiting (alignment model needed)...",
+                )
+            self._wait_until_not_recording()
+            if self._destroying:
+                return None, None
+
             self._alignment_event.clear()
             self._alignment_choice = None
 
@@ -895,43 +979,58 @@ class MeetRecorderWindow(Gtk.Window):
                 self._alignment_label.set_text(
                     f"Alignment model for {lang_name} not downloaded ({size})."
                 )
-                self._set_state(_State.AWAITING_ALIGNMENT)
+                self._alignment_box.show_all()
+                self.set_resizable(True)
+                self.resize(300, 280)
 
             GLib.idle_add(_show_prompt)
             self._alignment_event.wait()
 
             if self._alignment_choice == "download":
-                if not self._attempt_download(exc.lang, config):
-                    GLib.idle_add(self._set_error, "Download cancelled")
+                if not self._attempt_download(exc.lang, config, session_name):
+                    GLib.idle_add(
+                        self._set_bg_status,
+                        f"{session_name}: alignment download cancelled",
+                    )
                     return None, None
 
-                GLib.idle_add(self._set_state, _State.TRANSCRIBING)
+                GLib.idle_add(self._set_bg_status, f"Transcribing: {session_name}...")
                 try:
                     transcript = do_transcribe(output, config)
                 except Exception as retry_exc:
-                    GLib.idle_add(self._set_error, f"Transcription failed: {retry_exc}")
+                    GLib.idle_add(
+                        self._set_bg_status,
+                        f"{session_name}: transcription failed: {retry_exc}",
+                    )
                     return None, None
 
             elif self._alignment_choice == "skip":
-                GLib.idle_add(self._set_state, _State.TRANSCRIBING)
+                GLib.idle_add(self._set_bg_status, f"Transcribing: {session_name}...")
                 config.skip_alignment = True
                 try:
                     transcript = do_transcribe(output, config)
                 except Exception as skip_exc:
-                    GLib.idle_add(self._set_error, f"Transcription failed: {skip_exc}")
+                    GLib.idle_add(
+                        self._set_bg_status,
+                        f"{session_name}: transcription failed: {skip_exc}",
+                    )
                     return None, None
             else:
-                GLib.idle_add(self._set_error, "Alignment model prompt cancelled")
+                GLib.idle_add(
+                    self._set_bg_status, f"{session_name}: alignment prompt cancelled"
+                )
                 return None, None
 
         except Exception as exc:
-            GLib.idle_add(self._set_error, f"Transcription failed: {exc}")
+            GLib.idle_add(
+                self._set_bg_status, f"{session_name}: transcription failed: {exc}"
+            )
             return None, None
 
         return config, transcript
 
-    def _do_label_speakers(self, output, transcript):
-        """Optionally show speaker labeling dialog and relabel transcript.
+    def _do_label_speakers_bg(self, output, transcript, session_name: str):
+        """Background-aware speaker labeling with deferred interactive dialog.
 
         Returns the (possibly relabeled) transcript.
         """
@@ -984,16 +1083,26 @@ class MeetRecorderWindow(Gtk.Window):
                             channel_map,
                         )
                     except Exception as exc:
-                        import logging
-
-                        logging.getLogger(__name__).warning(
-                            "Voice identification failed: %s", exc
-                        )
+                        _log.warning("Voice identification failed: %s", exc)
 
                 self._label_speakers = spk_infos
                 self._label_auto_matches = auto_matches
                 self._label_channel_map = channel_map
                 self._label_audio_path = wav_path
+
+                # Wait until user is not recording before showing dialog
+                if self._state in (_State.RECORDING, _State.PAUSED, _State.DRAINING):
+                    GLib.idle_add(
+                        self._set_bg_status,
+                        f"{session_name}: waiting to label speakers...",
+                    )
+                self._wait_until_not_recording()
+                if self._destroying:
+                    return transcript
+
+                GLib.idle_add(
+                    self._set_bg_status, f"{session_name}: labeling speakers..."
+                )
 
                 self._label_event.clear()
                 self._label_result = None
@@ -1004,7 +1113,9 @@ class MeetRecorderWindow(Gtk.Window):
                     _auto_matches=auto_matches,
                 ):
                     self._build_label_rows(_spk_infos, _wav_path, _auto_matches)
-                    self._set_state(_State.LABELING_SPEAKERS)
+                    self._label_box.show_all()
+                    self.set_resizable(True)
+                    self.resize(340, 350)
 
                 GLib.idle_add(_show_label_dialog)
                 self._label_event.wait()
@@ -1032,12 +1143,15 @@ class MeetRecorderWindow(Gtk.Window):
 
         return transcript
 
-    def _do_post_process(self, output, transcript):
-        """Run summarization and PDF generation after transcription."""
+    def _do_post_process_bg(self, output, transcript, session_name: str):
+        """Run summarization and PDF generation in background.
+
+        Returns the PDF path if generated, or None.
+        """
         from meet.transcribe import post_process
 
         if self._summarize:
-            GLib.idle_add(self._set_state, _State.SUMMARIZING)
+            GLib.idle_add(self._set_bg_status, f"Summarizing: {session_name}...")
 
         result = post_process(
             transcript,
@@ -1047,14 +1161,13 @@ class MeetRecorderWindow(Gtk.Window):
             summary_backend=self._summary_backend,
             summary_model=self._summary_model,
             progress_callback=lambda msg: GLib.idle_add(
-                self._status_label.set_text, msg
+                self._set_bg_status, f"{session_name}: {msg}"
             ),
         )
-        if result["pdf"]:
-            self._last_pdf = result["pdf"]
+        return result.get("pdf")
 
-    def _do_sync(self, output: Path) -> None:
-        """Check if this is a scheduled meeting, prompt for confirmation, then sync."""
+    def _do_sync_bg(self, output: Path, session_name: str) -> None:
+        """Check for scheduled meeting, prompt for sync (deferred), then sync."""
         try:
             from meet.sync import check_sync_candidate, sync_session, is_sync_configured
 
@@ -1063,6 +1176,15 @@ class MeetRecorderWindow(Gtk.Window):
 
             candidate = check_sync_candidate(output.parent)
             if candidate is None:
+                return
+
+            # Wait until user is not recording before showing prompt
+            if self._state in (_State.RECORDING, _State.PAUSED, _State.DRAINING):
+                GLib.idle_add(
+                    self._set_bg_status, f"{session_name}: waiting to confirm sync..."
+                )
+            self._wait_until_not_recording()
+            if self._destroying:
                 return
 
             # Show confirmation prompt
@@ -1074,7 +1196,9 @@ class MeetRecorderWindow(Gtk.Window):
 
             def _show_sync_prompt(_c=candidate, _d=date_str):
                 self._sync_label.set_text(f"Sync to repo?\n{_c.match.name} · {_d}")
-                self._set_state(_State.CONFIRMING_SYNC)
+                self._sync_box.show_all()
+                self.set_resizable(True)
+                self.resize(300, 240)
 
             GLib.idle_add(_show_sync_prompt)
             self._sync_event.wait()
@@ -1083,22 +1207,21 @@ class MeetRecorderWindow(Gtk.Window):
                 return
 
             # User confirmed — push
-            GLib.idle_add(self._set_state, _State.SYNCING)
+            GLib.idle_add(self._set_bg_status, f"{session_name}: syncing...")
             sync_session(
                 output.parent,
                 candidate.match,
                 progress_callback=lambda msg: GLib.idle_add(
-                    self._status_label.set_text, msg
+                    self._set_bg_status, f"{session_name}: {msg}"
                 ),
             )
         except Exception as exc:
-            import logging as _logging
-
-            _logging.getLogger(__name__).warning("Sync failed: %s", exc)
+            _log.warning("Sync failed: %s", exc)
 
     # ── State management ────────────────────────────────────────────────
 
     def _set_state(self, state):
+        """Set the primary UI state (recording controls + main status)."""
         self._state = state
 
         # Remove all status classes
@@ -1108,14 +1231,6 @@ class MeetRecorderWindow(Gtk.Window):
             "status-recording",
             "status-paused",
             "status-draining",
-            "status-transcribing",
-            "status-summarizing",
-            "status-preparing",
-            "status-downloading",
-            "status-awaiting",
-            "status-labeling",
-            "status-confirming",
-            "status-syncing",
             "status-done",
             "status-error",
         ):
@@ -1126,18 +1241,9 @@ class MeetRecorderWindow(Gtk.Window):
         for cls in ("pause-btn", "record-btn"):
             pctx.remove_class(cls)
 
-        # Hide action buttons by default; only hide alignment prompt
-        # if we're NOT entering the awaiting-alignment state
+        # Hide action buttons by default
         self._open_transcript_btn.hide()
         self._open_folder_btn.hide()
-        if state != _State.AWAITING_ALIGNMENT:
-            self._alignment_box.hide()
-        if state != _State.LABELING_SPEAKERS:
-            self._label_box.hide()
-        if state != _State.CONFIRMING_SYNC:
-            self._sync_box.hide()
-        if state != _State.DOWNLOADING_MODEL:
-            self._progress_bar.hide()
 
         # ── Button visibility: record button vs pause+stop button box ──
         if state in (_State.RECORDING, _State.PAUSED):
@@ -1175,67 +1281,10 @@ class MeetRecorderWindow(Gtk.Window):
             self._status_label.set_text(f"Flushing buffer... {DRAIN_SECONDS}s")
             sctx.add_class("status-draining")
 
-        elif state == _State.PREPARING_GPU:
-            self._record_btn.set_sensitive(False)
-            self._status_label.set_text("Preparing GPU...")
-            sctx.add_class("status-preparing")
-
-        elif state == _State.DOWNLOADING_MODEL:
-            self._record_btn.set_sensitive(False)
-            lang_name = self._alignment_lang or "model"
-            self._status_label.set_text(
-                f"Downloading alignment model for {lang_name}..."
-            )
-            sctx.add_class("status-downloading")
-            self._progress_bar.show()
-            self._progress_bar.pulse()
-
-        elif state == _State.TRANSCRIBING:
-            self._record_btn.set_sensitive(False)
-            self._status_label.set_text("Transcribing...")
-            sctx.add_class("status-transcribing")
-
-        elif state == _State.AWAITING_ALIGNMENT:
-            self._record_btn.set_sensitive(False)
-            lang_name = self._alignment_lang or "language"
-            self._status_label.set_text(f"Alignment model missing for {lang_name}")
-            sctx.add_class("status-awaiting")
-            # Show the alignment prompt and grow window to fit
-            self._alignment_box.show_all()
-            self.set_resizable(True)
-            self.resize(300, 280)
-
-        elif state == _State.SUMMARIZING:
-            self._record_btn.set_sensitive(False)
-            self._status_label.set_text("Generating summary...")
-            sctx.add_class("status-summarizing")
-
-        elif state == _State.LABELING_SPEAKERS:
-            self._record_btn.set_sensitive(False)
-            self._status_label.set_text("Assign names to speakers")
-            sctx.add_class("status-labeling")
-            self._label_box.show_all()
-            self.set_resizable(True)
-            self.resize(340, 350)
-
-        elif state == _State.CONFIRMING_SYNC:
-            self._record_btn.set_sensitive(False)
-            self._status_label.set_text("Scheduled meeting detected")
-            sctx.add_class("status-confirming")
-            self._sync_box.show_all()
-            self.set_resizable(True)
-            self.resize(300, 240)
-
-        elif state == _State.SYNCING:
-            self._record_btn.set_sensitive(False)
-            self._status_label.set_text("Syncing to repo...")
-            sctx.add_class("status-syncing")
-
         elif state == _State.DONE:
             self._record_btn.set_sensitive(True)
             if self._last_output:
                 # Prefer showing PDF if it exists, otherwise .txt
-                pdf_path = self._last_output.with_suffix(".pdf")
                 txt_path = self._last_output.with_suffix(".txt")
                 if self._last_pdf and self._last_pdf.exists():
                     self._status_label.set_text(f"Done — {self._last_pdf.name}")
@@ -1261,6 +1310,19 @@ class MeetRecorderWindow(Gtk.Window):
         self._error_msg = msg
         self._set_state(_State.ERROR)
 
+    def _set_bg_status(self, text: str | None):
+        """Update the secondary background-job status label.
+
+        Called from GTK main thread (via GLib.idle_add).
+        Pass None to clear/hide the label.
+        """
+        if text:
+            self._bg_label.set_text(text)
+            self._bg_label.show()
+        else:
+            self._bg_label.set_text("")
+            self._bg_label.hide()
+
     # ── Periodic UI update ──────────────────────────────────────────────
 
     def _poll_status(self) -> bool:
@@ -1281,24 +1343,34 @@ class MeetRecorderWindow(Gtk.Window):
                 self._timer_label.set_text(fmt_elapsed(status.elapsed_seconds))
                 self._size_label.set_text(fmt_size(status.file_size_bytes))
             remaining = self._drain_remaining
-            sctx = self._status_label.get_style_context()
             self._status_label.set_text(f"Flushing buffer... {remaining}s")
 
         elif self._state == _State.PAUSED:
             # Timer and size are frozen — no updates needed
             pass
 
-        elif self._state == _State.DOWNLOADING_MODEL:
-            self._progress_bar.pulse()
+        # Check if a background job completed while user was recording
+        # and we should now show the DONE state
+        if self._state == _State.IDLE and self._last_output:
+            # Only transition to DONE if no background jobs are pending
+            job_idle = self._job_queue.empty() and (
+                self._job_thread is None or not self._job_thread.is_alive()
+            )
+            if job_idle:
+                self._set_state(_State.DONE)
+                self._set_bg_status(None)
 
         return True  # keep polling
 
     # ── Cleanup ─────────────────────────────────────────────────────────
 
     def _on_destroy(self, _widget):
+        self._destroying = True
+
         if self._poll_id:
             GLib.source_remove(self._poll_id)
             self._poll_id = None
+
         # If still recording or paused, try to stop gracefully
         if self._session and self._state in (
             _State.RECORDING,
@@ -1309,6 +1381,12 @@ class MeetRecorderWindow(Gtk.Window):
                 self._session.stop()
             except Exception:
                 pass
+
+        # Unblock any background threads waiting for user input
+        self._alignment_event.set()
+        self._label_event.set()
+        self._sync_event.set()
+
         Gtk.main_quit()
 
 
@@ -1371,4 +1449,5 @@ def launch(
     win._progress_bar.hide()
     win._open_transcript_btn.hide()
     win._open_folder_btn.hide()
+    win._bg_label.hide()
     Gtk.main()
