@@ -13,11 +13,11 @@ The goal is to determine whether local models can match Sonnet 4.6 quality for f
 
 ### Relevant files
 
-- **System prompt:** `/home/kasita/models/meet/meet/prompts/summarize_system.md`
-- **User prompt:** `/home/kasita/models/meet/meet/prompts/summarize_user.md`
-- **User prompt (non-English):** `/home/kasita/models/meet/meet/prompts/summarize_user_lang.md`
-- **Summarization code:** `/home/kasita/models/meet/meet/summarize.py` (753 lines, 4 backends: claudemax, openrouter, ollama, openai)
-- **Language headers:** `/home/kasita/models/meet/meet/languages.py` (section header translations for DE, FR, ES, TR, FA)
+- **System prompt:** `meet/prompts/summarize_system.md`
+- **User prompt:** `meet/prompts/summarize_user.md`
+- **User prompt (non-English):** `meet/prompts/summarize_user_lang.md`
+- **Summarization code:** `meet/summarize.py` (4 backends: claudemax, openrouter, ollama, openai)
+- **Language headers:** `meet/languages.py` (section header translations for DE, FR, ES, TR, FA)
 - **Default Ollama model:** `gpt-oss:20b` (changed from `qwen3.5:9b` during this session, line 33 of `summarize.py`)
 
 ### Typical meeting characteristics
@@ -35,10 +35,10 @@ The goal is to determine whether local models can match Sonnet 4.6 quality for f
 
 | Meeting | Size | Tokens | Lang | Speakers | Complexity |
 |---------|------|--------|------|----------|------------|
-| DEVSTANDUP (20260416) | 26 KB | ~7K | EN | 4 | Medium — standup + debugging + side topics |
-| DEVSYNC (20260414) | 67 KB | ~17K | EN | 6 | High — multi-topic technical sync |
-| SOCRATICSEMINAR (20260325) | 118 KB | ~30K | DE | 8+ | Very high — 18+ topics, German language |
-| BLINKSTUFF (20260423) | 79 KB | ~20K | EN | 4 | High — business dev, 11+ distinct topics |
+| Meeting A | 26 KB | ~7K | EN | 4 | Medium — short-form discussion with side topics |
+| Meeting B | 67 KB | ~17K | EN | 6 | High — multi-topic technical discussion |
+| Meeting C | 118 KB | ~30K | DE | 8+ | Very high — 18+ topics, German |
+| Meeting D | 79 KB | ~20K | EN | 4 | High — 11+ distinct topics |
 
 ---
 
@@ -102,7 +102,7 @@ The `{overview}`, `{topics}`, `{actions}`, `{decisions}`, `{questions}`, `{none_
 
 ## Single-Pass Results (Current Approach)
 
-### Test: DEVSTANDUP (26 KB, ~7K tokens, English)
+### Test: Meeting A (26 KB, ~7K tokens, English)
 
 | Dimension | Sonnet 4.6 | gpt-oss:20b | qwen3.6:27b | qwen3.5:27b | gemma4-26b-16k |
 |-----------|:-:|:-:|:-:|:-:|:-:|
@@ -113,7 +113,7 @@ The `{overview}`, `{topics}`, `{actions}`, `{decisions}`, `{questions}`, `{none_
 | Open questions | 5 | 5 | 0 | 0 | 0 |
 | Time | 40s | 36s | 132s | 98s | 23s |
 
-### Test: BLINKSTUFF (79 KB, ~20K tokens, English)
+### Test: Meeting D (79 KB, ~20K tokens, English)
 
 | Dimension | Sonnet 4.6 | gpt-oss:20b | qwen3.6:27b |
 |-----------|:-:|:-:|:-:|
@@ -131,14 +131,14 @@ The `{overview}`, `{topics}`, `{actions}`, `{decisions}`, `{questions}`, `{none_
 1. **Format non-compliance** — All local models except gpt-oss deviate from the specified 5-section Markdown structure. They invent their own formats (tables, numbered sections, "Executive Summary" layouts).
 2. **Content tunneling** — Local models fixate on 1-3 topics (usually the most prominent or the last one discussed) and ignore the rest of the meeting.
 3. **System prompt ignorance** — qwen3.6 and qwen3.5 treat the transcript as a conversation to respond to, not a document to summarize. qwen3.6 literally offered a menu of things it *could* do instead of following the system prompt.
-4. **Hallucination** — gpt-oss invents dates, misnames entities ("BlinkBuzzers" instead of "BlinkBosses", "La Maison de TPV" instead of "La Casa de TPV", "Bitcoin Association" — never mentioned).
+4. **Hallucination** — gpt-oss invents dates, misnames entities (close-but-wrong proper nouns — e.g. swapping a syllable in a company name, mistranslating part of a foreign-language brand), and fabricates organization names that were never mentioned in the transcript.
 5. **Context limitation** — gemma4-26b-16k has a 16K context limit, truncating 2 of 3 test meetings.
 
 ---
 
 ## Improved Prompt (Single-Pass)
 
-Tested on BLINKSTUFF with gpt-oss:20b. This prompt was designed to address format non-compliance, hallucination, and content tunneling.
+Tested on Meeting D with gpt-oss:20b. This prompt was designed to address format non-compliance, hallucination, and content tunneling.
 
 ```markdown
 You are a meeting summarizer. Read the transcript and output EXACTLY the Markdown structure shown below — no other sections, no tables, no preamble, no closing remarks.
@@ -191,7 +191,7 @@ RULES:
 
 ### Result: Improved prompt made things WORSE
 
-On BLINKSTUFF with gpt-oss:20b:
+On Meeting D with gpt-oss:20b:
 - Format compliance dropped from 4/5 to 0/5 (reverted to table layout)
 - Topic coverage went from 5 to 6 but still grouped
 - Hallucinations persisted
@@ -308,7 +308,7 @@ Organize the following extracted meeting data into the required format:
 
 ## Double-Pass Results
 
-### Test: BLINKSTUFF (79 KB, ~20K tokens, English)
+### Test: Meeting D (79 KB, ~20K tokens, English)
 
 #### gpt-oss:20b
 
@@ -330,7 +330,7 @@ Organize the following extracted meeting data into the required format:
 **Remaining issues:**
 - Content coverage still ~50% of Sonnet 4.6 (5 topics vs 11)
 - Open questions section empty despite 8 genuine open items in the meeting
-- 1 hallucination persisted ("Fluff" store — not in transcript)
+- 1 hallucination persisted (an invented store name not in transcript)
 - Pass 1 does not follow its own format instructions (tables instead of numbered lists) — but Pass 2 compensates
 
 #### qwen3.6:27b
@@ -353,14 +353,14 @@ Organize the following extracted meeting data into the required format:
 **Remaining issues:**
 - Very slow (353s total — 236s extraction + 118s formatting)
 - Content coverage ~50% of Sonnet 4.6
-- Hallucinated "Kamal" (should be "Kemal") and "Blink Buzzers" (should be "BlinkBosses")
+- Hallucinated proper nouns: misspelled a real participant's first name and corrupted a company name (same close-but-wrong pattern as gpt-oss)
 - Open questions section empty
 
 ---
 
 ## Summary of All Approaches
 
-### On BLINKSTUFF meeting (the hardest test — 79 KB, ~20K tokens, 11 topics)
+### On Meeting D (the hardest test — 79 KB, ~20K tokens, 11 topics)
 
 | Approach | Format | Content | Hallucination | Speed | Verdict |
 |----------|:-:|:-:|:-:|:-:|:--|
@@ -437,7 +437,7 @@ The content coverage gap (~50%) is a model capability issue. Options to close it
 - 262K context
 - In single-pass mode: completely ignores system prompt and offers a menu instead of summarizing
 - In double-pass mode: produces good results but very slow (353s)
-- Hallucinated speaker names ("Kamal" instead of "Kemal")
+- Hallucinated speaker names (close-but-wrong proper nouns)
 - Not recommended for meetscribe due to speed, but viable as a fallback
 
 ### qwen3.5:27b
