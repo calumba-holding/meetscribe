@@ -59,13 +59,19 @@ def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
 
 
 def _generate_summary(
-    transcript, out_dir, basename, summary_model, files, summary_backend=None
+    transcript, out_dir, basename, summary_model, files, summary_backend=None,
+    ollama_singlepass=False,
 ):
     """Generate an AI meeting summary. Returns MeetingSummary or None.
 
     Supports multiple backends (claudemax, openrouter, ollama) via SummaryConfig.
     The fallback chain is handled inside summarize() — callers should not
     gate on is_backend_available().
+
+    When ``ollama_singlepass`` is True, the legacy single-pass flow is used
+    for the ollama backend.  By default the two-pass (extract+format) flow
+    is used, which is more accurate on local 20B-class models at the cost
+    of one extra LLM call.
     """
     from meet.summarize import summarize as do_summarize, SummaryConfig
 
@@ -74,6 +80,8 @@ def _generate_summary(
         config_kwargs["backend"] = summary_backend
     if summary_model:
         config_kwargs["model"] = summary_model
+    if ollama_singlepass:
+        config_kwargs["ollama_singlepass"] = True
     summary_config = SummaryConfig(**config_kwargs)
 
     def _cli_progress(msg: str) -> None:
@@ -329,6 +337,12 @@ def record(output_dir, filename, mic, monitor, virtual_sink):
     help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
 )
 @click.option(
+    "--ollama-singlepass",
+    is_flag=True,
+    default=False,
+    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MEETSCRIBE_OLLAMA_SINGLEPASS=1.",
+)
+@click.option(
     "--skip-alignment",
     is_flag=True,
     default=False,
@@ -355,6 +369,7 @@ def transcribe(
     summarize,
     summary_backend,
     summary_model,
+    ollama_singlepass,
     skip_alignment,
     mixdown,
 ):
@@ -450,6 +465,7 @@ def transcribe(
             summary_model,
             files,
             summary_backend=summary_backend,
+            ollama_singlepass=ollama_singlepass,
         )
 
     _generate_pdf(transcript, out_dir, audio_path.stem, summary_result, files)
@@ -518,6 +534,12 @@ def transcribe(
     help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
 )
 @click.option(
+    "--ollama-singlepass",
+    is_flag=True,
+    default=False,
+    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MEETSCRIBE_OLLAMA_SINGLEPASS=1.",
+)
+@click.option(
     "--skip-alignment",
     is_flag=True,
     default=False,
@@ -543,6 +565,7 @@ def run(
     summarize,
     summary_backend,
     summary_model,
+    ollama_singlepass,
     skip_alignment,
     mixdown,
 ):
@@ -647,6 +670,7 @@ def run(
                 summary_model,
                 files,
                 summary_backend=summary_backend,
+                ollama_singlepass=ollama_singlepass,
             )
 
         _generate_pdf(transcript, output.parent, output.stem, summary_result, files)
@@ -1003,7 +1027,13 @@ def translate(session_dir, target_lang, summary_model):
     default=None,
     help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
 )
-def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_model):
+@click.option(
+    "--ollama-singlepass",
+    is_flag=True,
+    default=False,
+    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MEETSCRIBE_OLLAMA_SINGLEPASS=1.",
+)
+def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_model, ollama_singlepass):
     """Assign real names to speakers in a transcribed session.
 
     \b
@@ -1223,6 +1253,7 @@ def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_mode
         regenerate_summary=regenerate_summary,
         summary_backend=summary_backend,
         summary_model=summary_model,
+        ollama_singlepass=ollama_singlepass,
         progress_callback=lambda msg: click.echo(f"  {msg}"),
     )
 
@@ -1638,6 +1669,12 @@ def archive(session_dirs, older_than, keep_wav, dry_run):
     default=None,
     help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
 )
+@click.option(
+    "--ollama-singlepass",
+    is_flag=True,
+    default=False,
+    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MEETSCRIBE_OLLAMA_SINGLEPASS=1.",
+)
 def gui(
     output_dir,
     model,
@@ -1654,6 +1691,7 @@ def gui(
     summarize,
     summary_backend,
     summary_model,
+    ollama_singlepass,
 ):
     """Launch the GUI recording widget."""
     from meet.gui import launch
@@ -1674,6 +1712,7 @@ def gui(
         summarize=summarize,
         summary_backend=summary_backend,
         summary_model=summary_model,
+        ollama_singlepass=ollama_singlepass,
     )
 
 

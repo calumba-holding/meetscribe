@@ -205,6 +205,7 @@ class MeetRecorderWindow(Gtk.Window):
         summarize: bool = True,
         summary_backend: str | None = None,
         summary_model: str | None = None,
+        ollama_singlepass: bool = False,
     ):
         super().__init__(title="Meet Recorder")
 
@@ -213,6 +214,7 @@ class MeetRecorderWindow(Gtk.Window):
         self._summarize = summarize
         self._summary_backend = summary_backend
         self._summary_model = summary_model
+        self._ollama_singlepass = ollama_singlepass
         self._session = None
         self._state = _State.IDLE
         self._worker_thread = None
@@ -1150,6 +1152,7 @@ class MeetRecorderWindow(Gtk.Window):
             summarize=self._summarize,
             summary_backend=self._summary_backend,
             summary_model=self._summary_model,
+            ollama_singlepass=self._ollama_singlepass,
             progress_callback=lambda msg: GLib.idle_add(
                 self._set_bg_status, f"{session_name}: {msg}"
             ),
@@ -1391,6 +1394,7 @@ def launch(
     summarize: bool = True,
     summary_backend: str | None = None,
     summary_model: str | None = None,
+    ollama_singlepass: bool = False,
 ) -> None:
     """Launch the Meet Recorder GTK3 window.
 
@@ -1420,6 +1424,7 @@ def launch(
         summarize=summarize,
         summary_backend=summary_backend,
         summary_model=summary_model,
+        ollama_singlepass=ollama_singlepass,
     )
     win.show_all()
     # Hide widgets that should only appear on demand

@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.4.2 — 2026-04-24
+
+### Improvements
+
+- **Two-pass Ollama summarization (default for local LLMs)** — the local
+  Ollama backend now runs a separate extraction pass (Pass 1: pull topics,
+  actions, decisions, questions out of the transcript with a wide context
+  window) followed by a formatting pass (Pass 2: organize the extracted
+  data into the canonical Markdown structure with a small 8K context).
+  This dramatically improves format compliance and reduces hallucinations
+  on 20B-class local models like `gpt-oss:20b`. Cloud backends
+  (claudemax, openrouter, openai) are unchanged — they remain single-pass.
+- **Improved cloud-summary prompt** — the system prompt used by the
+  cloud backends has been rewritten based on A/B-tested results: more
+  topics extracted, ~20% faster on Sonnet, no regressions.
+- **`--ollama-singlepass` opt-out flag** — added to `transcribe`, `run`,
+  `gui`, and `label` commands for users who want the previous single-pass
+  behavior. Also configurable via `MEETSCRIBE_OLLAMA_SINGLEPASS=1`.
+- **Per-pass timing in summary sidecar** — the `.summary.meta.json`
+  sidecar now records `mode: "two_pass"`, `pass1_seconds`,
+  `pass2_seconds`, and `pass1_chars` when two-pass was used.
+
+### Documentation
+
+- Added `docs/local-model-evaluation.md` — full evaluation of local
+  20B-class models on 4 reference transcripts, including known
+  failure modes (gpt-oss:20b unreliability on low-information short
+  transcripts, qwen3.6:27b reasoning-mode bottleneck, and the
+  rationale for the two-pass design).
+
+### Testing
+
+- Added 27 new tests covering env-var resolution, two-pass system
+  prompts (en + de), two-pass call flow, dispatcher routing, and
+  sidecar serialization. All 127 tests pass.
+
+### Known limitations
+
+- `gpt-oss:20b` may hallucinate on transcripts dominated by very
+  short low-information utterances ("yes", "okay"). For such meetings
+  the cloud backends produce more reliable summaries — the fallback
+  chain (claudemax → openrouter → ollama) handles this automatically
+  if a cloud backend is configured.
+- `gpt-oss:20b` may exceed the default 600s timeout on very large
+  (>100 KB) non-English transcripts during Pass 1. The fallback chain
+  catches this; alternatively pass `--summary-timeout 1200` or use a
+  cloud backend.
+
+---
+
 ## v0.4.1 — 2026-04-13
 
 ### Improvements

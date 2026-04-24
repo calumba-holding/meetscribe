@@ -1287,6 +1287,7 @@ def post_process(
     summarize: bool = True,
     summary_backend: str | None = None,
     summary_model: str | None = None,
+    ollama_singlepass: bool = False,
     progress_callback=None,
 ) -> dict:
     """Run summarization and PDF generation after transcription.
@@ -1324,6 +1325,8 @@ def post_process(
                 cfg_kwargs["backend"] = summary_backend
             if summary_model:
                 cfg_kwargs["model"] = summary_model
+            if ollama_singlepass:
+                cfg_kwargs["ollama_singlepass"] = True
             summary_config = SummaryConfig(**cfg_kwargs)
 
             summary_result = do_summarize(

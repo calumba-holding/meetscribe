@@ -303,6 +303,7 @@ def apply_labels(
     regenerate_summary: bool = True,
     summary_backend: str | None = None,
     summary_model: str | None = None,
+    ollama_singlepass: bool = False,
     progress_callback: Any | None = None,
 ) -> dict[str, Path]:
     """Apply user-assigned speaker names to a session's outputs.
@@ -366,6 +367,8 @@ def apply_labels(
                 cfg_kwargs["backend"] = summary_backend
             if summary_model:
                 cfg_kwargs["model"] = summary_model
+            if ollama_singlepass:
+                cfg_kwargs["ollama_singlepass"] = True
             summary_config = SummaryConfig(**cfg_kwargs)
 
             if is_backend_available(summary_config):

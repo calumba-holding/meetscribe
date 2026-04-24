@@ -348,6 +348,39 @@ export MEETSCRIBE_SUMMARY_MODEL=anthropic/claude-sonnet-4.6
 If the configured backend is unavailable, meetscribe automatically tries the
 next one in the fallback chain: claudemax → openrouter → ollama.
 
+### Two-pass local summarization
+
+When the **ollama** backend is selected (the default), meetscribe runs two
+LLM calls instead of one:
+
+1. **Pass 1 (extraction)** — pulls topics, actions, decisions, and open
+   questions out of the transcript as plain numbered lists, using a
+   context window sized to the full transcript.
+2. **Pass 2 (formatting)** — takes the much smaller extracted data and
+   organizes it into the canonical Markdown structure with a fixed 8K
+   context window.
+
+This dramatically improves format compliance and reduces hallucinations
+on 20B-class local models (`gpt-oss:20b`, `qwen3.6:27b`) compared to a
+single-pass call, at the cost of one additional LLM call (~30–90s extra).
+Cloud backends (claudemax, openrouter, openai) remain single-pass — they
+already produce well-structured output in one shot.
+
+To opt out and use the previous single-pass behavior:
+
+```bash
+meet run --ollama-singlepass
+# Or via environment:
+export MEETSCRIBE_OLLAMA_SINGLEPASS=1
+```
+
+The `.summary.meta.json` sidecar records per-pass timings
+(`pass1_seconds`, `pass2_seconds`, `pass1_chars`) when two-pass was used.
+
+See [docs/local-model-evaluation.md](docs/local-model-evaluation.md) for
+the full evaluation that motivated this design, including known failure
+modes of local 20B-class models.
+
 ### Customizing the prompt
 
 The summarization prompt lives in `meet/prompts/summarize_system.md`. Edit it
@@ -527,6 +560,12 @@ export LD_LIBRARY_PATH=$HOME/.local/lib/cuda:$LD_LIBRARY_PATH
 - Speaker labels default to role-based (YOU, REMOTE_1, REMOTE_2) — use `meet label` or the GUI dialog to assign real names
 - Diarization accuracy varies with audio quality and number of speakers
 - Linux only (PulseAudio/PipeWire dependency)
+- Local 20B-class summary models (e.g. `gpt-oss:20b`) can hallucinate on
+  transcripts dominated by very short low-information utterances ("yes",
+  "okay") and may exceed the default 600s timeout on very large
+  (>100 KB) non-English transcripts. For these cases configure a cloud
+  backend (claudemax / openrouter) — the fallback chain takes over
+  automatically. See [docs/local-model-evaluation.md](docs/local-model-evaluation.md).
 
 ## Contributing
 

@@ -13,7 +13,7 @@ tries the next backend in the fallback order.
 Configuration precedence (highest to lowest):
   1. Explicit keyword arguments / CLI flags (--summary-backend, --summary-model)
   2. Environment variables (MEETSCRIBE_SUMMARY_BACKEND, MEETSCRIBE_SUMMARY_MODEL)
-  3. Hardcoded defaults (ollama / qwen3.5:9b)
+  3. Hardcoded defaults (ollama / gpt-oss:20b)
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import requests
 # ─── Constants ──────────────────────────────────────────────────────────────
 
 # Ollama defaults
-DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
+DEFAULT_OLLAMA_MODEL = "gpt-oss:20b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT = 600  # 10 minutes max
 
@@ -71,18 +71,26 @@ def _load_prompt(filename: str) -> str | None:
     return None
 
 
+def _lang_instruction(language: str | None) -> str:
+    """Return the appended CRITICAL language instruction line for a non-English language.
+
+    Returns an empty string for English / unknown so prompts stay clean.
+    """
+    if not language or language == "en":
+        return ""
+    lang_name = _LANGUAGE_NAMES.get(language, language)
+    return (
+        f"\n- CRITICAL: Write the ENTIRE summary in {lang_name}, "
+        f"including ALL section headers. Do NOT use any English text."
+    )
+
+
 def _build_system_prompt(language: str | None = None) -> str:
     """Build the system prompt with section headers in the target language."""
     lang = language or "en"
     h = _SECTION_HEADERS.get(lang, _SECTION_HEADERS["en"])
 
-    lang_instruction = ""
-    if lang != "en":
-        lang_name = _LANGUAGE_NAMES.get(lang, lang)
-        lang_instruction = (
-            f"\n- CRITICAL: Write the ENTIRE summary in {lang_name}, "
-            f"including ALL section headers. Do NOT use any English text."
-        )
+    lang_instruction = _lang_instruction(lang)
 
     template = _load_prompt("summarize_system.md")
     if template is not None:
@@ -146,6 +154,85 @@ def _load_user_prompt_template_lang() -> str:
     )
 
 
+# ─── Two-pass (extract + format) prompts ──────────────────────────────────
+
+def _extract_lang_instruction(language: str | None) -> str:
+    """Lang instruction appended to Pass 1 (extraction) system prompt."""
+    if not language or language == "en":
+        return ""
+    lang_name = _LANGUAGE_NAMES.get(language, language)
+    return f"\n- CRITICAL: Output the extracted lists in {lang_name}."
+
+
+def _format_lang_instruction(language: str | None) -> str:
+    """Lang instruction appended to Pass 2 (formatting) system prompt."""
+    if not language or language == "en":
+        return ""
+    lang_name = _LANGUAGE_NAMES.get(language, language)
+    return (
+        f"\n- CRITICAL: Output everything in {lang_name}, including section headers. "
+        "Do NOT use any English text."
+    )
+
+
+def _build_extract_system_prompt(language: str | None = None) -> str:
+    """Build the Pass 1 (extraction) system prompt for the two-pass Ollama flow."""
+    lang_instruction = _extract_lang_instruction(language)
+    template = _load_prompt("summarize_extract_system.md")
+    if template is not None:
+        return template.format(lang_instruction=lang_instruction)
+    # Inline fallback
+    return (
+        "You are a meeting transcript analyzer. Extract topics, actions, "
+        "decisions, and questions from the transcript as plain numbered "
+        f"lists.{lang_instruction}"
+    )
+
+
+def _build_format_system_prompt(language: str | None = None) -> str:
+    """Build the Pass 2 (formatting) system prompt for the two-pass Ollama flow."""
+    lang = language or "en"
+    h = _SECTION_HEADERS.get(lang, _SECTION_HEADERS["en"])
+    lang_instruction = _format_lang_instruction(lang)
+    template = _load_prompt("summarize_format_system.md")
+    if template is not None:
+        return template.format(
+            overview=h["overview"],
+            topics=h["topics"],
+            actions=h["actions"],
+            decisions=h["decisions"],
+            questions=h["questions"],
+            none_stated=h["none_stated"],
+            lang_instruction=lang_instruction,
+        )
+    # Inline fallback
+    return (
+        f"Format the extracted meeting data into Markdown with sections: "
+        f"## {h['overview']}, ## {h['topics']}, ## {h['actions']}, "
+        f"## {h['decisions']}, ## {h['questions']}.{lang_instruction}"
+    )
+
+
+def _load_extract_user_template() -> str:
+    template = _load_prompt("summarize_extract_user.md")
+    if template is not None:
+        return template
+    return (
+        "Extract all topics, actions, decisions, and questions from this "
+        "transcript:\n\n---\n{transcript}\n---"
+    )
+
+
+def _load_format_user_template() -> str:
+    template = _load_prompt("summarize_format_user.md")
+    if template is not None:
+        return template
+    return (
+        "Organize the following extracted meeting data into the required "
+        "format:\n\n---\n{extracted}\n---"
+    )
+
+
 USER_PROMPT_TEMPLATE = _load_user_prompt_template()
 
 USER_PROMPT_TEMPLATE_LANG = _load_user_prompt_template_lang()
@@ -172,6 +259,12 @@ def _resolve_model(backend: str) -> str:
     return DEFAULT_OLLAMA_MODEL
 
 
+def _resolve_ollama_singlepass() -> bool:
+    """Resolve the default for the ollama single-pass opt-out from the env var."""
+    raw = os.environ.get("MEETSCRIBE_OLLAMA_SINGLEPASS", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 @dataclass
 class SummaryConfig:
     """Configuration for meeting summary generation.
@@ -190,6 +283,7 @@ class SummaryConfig:
     timeout: int = DEFAULT_TIMEOUT
     temperature: float = 0.3
     num_ctx: int = 8192  # Ollama-specific context window
+    ollama_singlepass: bool | None = None  # None = resolve from env (default: two-pass)
 
     def __post_init__(self):
         # Resolve backend: explicit arg > env var > "ollama"
@@ -207,6 +301,10 @@ class SummaryConfig:
         if self.model is None:
             self.model = _resolve_model(self.backend)
 
+        # Resolve ollama two-pass opt-out: explicit arg > env > False (two-pass on)
+        if self.ollama_singlepass is None:
+            self.ollama_singlepass = _resolve_ollama_singlepass()
+
 
 @dataclass
 class MeetingSummary:
@@ -216,12 +314,18 @@ class MeetingSummary:
     model: str
     elapsed_seconds: float
     backend: str = ""
+    # Optional fields populated by the two-pass Ollama flow
+    pass1_seconds: float | None = None
+    pass2_seconds: float | None = None
+    pass1_chars: int | None = None
+    extraction: str | None = None  # Raw Pass 1 output (kept in-memory only)
 
     def save(self, output_dir: str | Path, basename: str) -> Path:
         """Save the summary as a .summary.md file and a .summary.meta.json sidecar.
 
         The sidecar records which backend/model produced the summary so that
-        it can be determined post-hoc.
+        it can be determined post-hoc.  When the two-pass Ollama flow was used,
+        per-pass timings and the extracted-data character count are recorded too.
 
         Returns the path to the saved .summary.md file.
         """
@@ -233,12 +337,18 @@ class MeetingSummary:
         md_path = output_dir / f"{basename}.summary.md"
         md_path.write_text(self.markdown, encoding="utf-8")
 
-        meta = {
+        meta: dict[str, Any] = {
             "backend": self.backend,
             "model": self.model,
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "timestamp": datetime.datetime.now().isoformat(),
         }
+        if self.pass1_seconds is not None:
+            meta["mode"] = "two_pass"
+            meta["pass1_seconds"] = round(self.pass1_seconds, 2)
+            meta["pass2_seconds"] = round(self.pass2_seconds or 0.0, 2)
+            if self.pass1_chars is not None:
+                meta["pass1_chars"] = self.pass1_chars
         meta_path = output_dir / f"{basename}.summary.meta.json"
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
@@ -353,12 +463,20 @@ def _dynamic_num_ctx(
     return max(floor, min(needed, ceiling))
 
 
-def _summarize_ollama(
+def _call_ollama_chat(
     system_prompt: str,
     user_prompt: str,
     config: SummaryConfig,
-) -> MeetingSummary:
-    """Send a summarization request to local Ollama."""
+    *,
+    num_ctx: int | None = None,
+    timeout: int | None = None,
+    temperature: float | None = None,
+) -> tuple[str, float]:
+    """Single Ollama /api/chat call. Returns (content, elapsed_seconds).
+
+    Raises ConnectionError if Ollama is unreachable, RuntimeError on API
+    error / empty response.  Used by both the single-pass and two-pass flows.
+    """
     import time
 
     if not is_ollama_available(config.ollama_url):
@@ -367,12 +485,14 @@ def _summarize_ollama(
             "Start it with: ollama serve"
         )
 
-    # Dynamically size the context window based on actual prompt length
-    # so long transcripts are not silently truncated.
-    num_ctx = _dynamic_num_ctx(
-        system_prompt, user_prompt,
-        floor=config.num_ctx,  # never go below the configured minimum
-    )
+    if num_ctx is None:
+        num_ctx = _dynamic_num_ctx(
+            system_prompt, user_prompt, floor=config.num_ctx,
+        )
+    if timeout is None:
+        timeout = config.timeout
+    if temperature is None:
+        temperature = config.temperature
 
     payload: dict[str, Any] = {
         "model": config.model,
@@ -383,41 +503,102 @@ def _summarize_ollama(
         "stream": False,
         "think": False,  # Disable thinking/reasoning for speed
         "options": {
-            "temperature": config.temperature,
+            "temperature": temperature,
             "num_ctx": num_ctx,
         },
     }
 
     url = f"{config.ollama_url}/api/chat"
     t0 = time.time()
-
     try:
-        resp = requests.post(url, json=payload, timeout=config.timeout)
+        resp = requests.post(url, json=payload, timeout=timeout)
         resp.raise_for_status()
     except requests.Timeout:
         raise RuntimeError(
-            f"Ollama timed out after {config.timeout}s. "
+            f"Ollama timed out after {timeout}s. "
             f"The model '{config.model}' may be too large or slow. "
             "Try a smaller model with --summary-model."
         )
     except requests.HTTPError as e:
         raise RuntimeError(f"Ollama API error: {e}")
-
     elapsed = time.time() - t0
     data = resp.json()
-    content = data.get("message", {}).get("content", "")
-
-    if not content.strip():
+    content = (data.get("message", {}).get("content") or "").strip()
+    if not content:
         raise RuntimeError(
             f"Ollama returned an empty response. Model '{config.model}' may "
             "not be available. Check with: ollama list"
         )
+    return content, elapsed
 
+
+def _summarize_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    config: SummaryConfig,
+) -> MeetingSummary:
+    """Send a single-pass summarization request to local Ollama."""
+    content, elapsed = _call_ollama_chat(system_prompt, user_prompt, config)
     return MeetingSummary(
-        markdown=content.strip(),
+        markdown=content,
         model=config.model,
         elapsed_seconds=elapsed,
         backend="ollama",
+    )
+
+
+def _summarize_ollama_twopass(
+    transcript_text: str,
+    config: SummaryConfig,
+    language: str | None = None,
+) -> MeetingSummary:
+    """Two-pass Ollama summarization: extract (Pass 1) then format (Pass 2).
+
+    Pass 1 uses a wide context window sized to the transcript and a long
+    timeout to extract topics/actions/decisions/questions as plain numbered
+    lists.  Pass 2 takes the much smaller extracted data and formats it into
+    the canonical Markdown structure with a fixed 8K context window and a
+    shorter timeout.
+
+    This dramatically improves format compliance and reduces hallucinations
+    on local 20B-class models like gpt-oss:20b and qwen3.6:27b, at the cost
+    of one additional LLM call (typically ~30-90s extra).
+    """
+    # ── Pass 1: extraction ────────────────────────────────────────────────
+    extract_sys = _build_extract_system_prompt(language)
+    extract_user_tmpl = _load_extract_user_template()
+    extract_user = extract_user_tmpl.format(transcript=transcript_text)
+    extracted, t1 = _call_ollama_chat(
+        extract_sys, extract_user, config,
+        # Pass 1 needs the full transcript to fit; let _dynamic_num_ctx size it
+        num_ctx=None,
+        timeout=config.timeout,
+        temperature=config.temperature,
+    )
+
+    # ── Pass 2: formatting ────────────────────────────────────────────────
+    format_sys = _build_format_system_prompt(language)
+    format_user_tmpl = _load_format_user_template()
+    format_user = format_user_tmpl.format(extracted=extracted)
+    # Pass 2 input is small (the extracted lists). Cap context at 8K and use a
+    # shorter timeout so we fail fast if something goes wrong.
+    pass2_timeout = min(config.timeout, 240)
+    formatted, t2 = _call_ollama_chat(
+        format_sys, format_user, config,
+        num_ctx=8192,
+        timeout=pass2_timeout,
+        temperature=config.temperature,
+    )
+
+    return MeetingSummary(
+        markdown=formatted,
+        model=config.model,
+        elapsed_seconds=t1 + t2,
+        backend="ollama",
+        pass1_seconds=t1,
+        pass2_seconds=t2,
+        pass1_chars=len(extracted),
+        extraction=extracted,
     )
 
 
@@ -636,11 +817,18 @@ def _dispatch(
     system_prompt: str,
     user_prompt: str,
     config: SummaryConfig,
+    *,
+    transcript_text: str | None = None,
+    language: str | None = None,
 ) -> MeetingSummary:
     """Dispatch to a specific backend's summarization function.
 
     Creates a temporary config with the correct backend and model if
     falling back from the originally configured backend.
+
+    For the ollama backend, uses the two-pass (extract+format) flow by
+    default unless ``config.ollama_singlepass`` is True.  Two-pass requires
+    ``transcript_text`` and ``language`` to be passed through.
     """
     if backend != config.backend:
         # Build a new config for the fallback backend with its own default model
@@ -651,6 +839,7 @@ def _dispatch(
             timeout=config.timeout,
             temperature=config.temperature,
             num_ctx=config.num_ctx,
+            ollama_singlepass=config.ollama_singlepass,
         )
     else:
         fallback_config = config
@@ -662,7 +851,13 @@ def _dispatch(
     elif backend == "openai":
         result = _summarize_openai(system_prompt, user_prompt, fallback_config)
     else:
-        result = _summarize_ollama(system_prompt, user_prompt, fallback_config)
+        # Ollama: prefer the two-pass flow unless explicitly opted out
+        if not fallback_config.ollama_singlepass and transcript_text is not None:
+            result = _summarize_ollama_twopass(
+                transcript_text, fallback_config, language=language,
+            )
+        else:
+            result = _summarize_ollama(system_prompt, user_prompt, fallback_config)
 
     # Defense-in-depth: catch error text masquerading as a valid summary
     _validate_summary_content(result.markdown, backend)
@@ -737,8 +932,16 @@ def summarize(
         if backend != config.backend:
             _log(f"Falling back to {backend} ({_resolve_model(backend)})...")
 
+        # Inform the user when the local two-pass flow is about to run, since
+        # it takes noticeably longer than a single LLM call.
+        if backend == "ollama" and not config.ollama_singlepass:
+            _log("Running Ollama two-pass summarization (extract + format)...")
+
         try:
-            result = _dispatch(backend, system_prompt, user_prompt, config)
+            result = _dispatch(
+                backend, system_prompt, user_prompt, config,
+                transcript_text=transcript_text, language=language,
+            )
             if backend != config.backend:
                 _log(f"Summary generated via fallback backend {backend}")
             return result
