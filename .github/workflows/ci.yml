@@ -8,15 +8,40 @@ name: CI
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
+
+      # The static [project] version in pyproject.toml and the fallback in
+      # millet/__init__.py must move together (release 0.12.14 exists solely
+      # because they didn't).
+      - name: Check version sync (pyproject.toml == millet/__init__.py)
+        run: |
+          python - <<'EOF'
+          # regex (not tomllib): the matrix includes 3.10, which lacks tomllib
+          import re, sys
+          proj_m = re.search(
+              r'^version\s*=\s*"([^"]+)"', open("pyproject.toml").read(), re.M
+          )
+          proj = proj_m.group(1) if proj_m else "<missing>"
+          init_m = re.search(
+              r'^__version__\s*=\s*"([^"]+)"', open("millet/__init__.py").read(), re.M
+          )
+          init = init_m.group(1) if init_m else "<missing>"
+          if proj != init or proj == "<missing>":
+              sys.exit(f"version mismatch: pyproject.toml={proj} millet/__init__.py={init}")
+          print(f"version OK: {proj}")
+          EOF
 
       # ffmpeg/ffprobe are required at runtime by millet_record.audio
       # (read_stereo_channels probes channels via ffprobe and decodes via
@@ -49,13 +74,15 @@ jobs:
         # whisperx + torch (~700 MB) and a GTK display aren't available in CI.
         # Run the suites that monkeypatch their heavy deps; skip test_gui.py
         # (needs gi/GTK) and the torch-device-detection cases in
-        # test_transcribe.py / test_cli.py.
+        # test_transcribe.py.
         run: |
           pytest -q \
             tests/test_shim_imports.py \
             tests/test_paths.py \
             tests/test_utils.py \
             tests/test_capture.py \
+            tests/test_cli.py \
+            tests/test_parakeet.py \
             tests/test_summarize.py \
             tests/test_summarize_twopass.py \
             tests/test_summarize_tinfoil_retry.py \
@@ -64,5 +91,6 @@ jobs:
             tests/test_label.py \
             tests/test_ingest.py \
             tests/test_ssl_cert_injection.py \
+            tests/test_sync_core.py \
             tests/test_sync_team.py \
             tests/test_voiceprint_gate.py

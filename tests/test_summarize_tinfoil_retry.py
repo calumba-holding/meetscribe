@@ -59,6 +59,7 @@ def _install_fake_tinfoil(monkeypatch, behavior):
 
     class _Completions:
         def create(self, **kwargs):
+            state["create_kwargs"] = kwargs
             return _Resp()
 
     class _Chat:
@@ -109,6 +110,18 @@ def test_persistent_transient_fails_after_max_attempts(monkeypatch):
     with pytest.raises(RuntimeError, match="unreachable after"):
         sm._summarize_tinfoil("sys", "user", cfg)
     assert state["attempt"] == sm._TINFOIL_MAX_ATTEMPTS  # all attempts used
+
+
+def test_completion_call_passes_timeout(monkeypatch):
+    """Regression (0.13.0): the Tinfoil completion call was the only
+    backend call without a timeout — a stalled TLS connection to the
+    enclave hung the pipeline forever, worst for the no-fallback
+    `confidential` preset."""
+    state = _install_fake_tinfoil(monkeypatch, lambda attempt: None)
+    cfg = SummaryConfig(backend="tinfoil", model="deepseek-v4-pro")
+    sm._summarize_tinfoil("sys", "user", cfg)
+    assert state["create_kwargs"].get("timeout") == cfg.timeout
+    assert cfg.timeout and cfg.timeout > 0
 
 
 def test_auth_error_fails_fast_no_retry(monkeypatch):

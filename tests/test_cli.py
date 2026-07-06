@@ -39,8 +39,23 @@ def _stub_transcribe_pipeline():
         patch("millet.transcribe.transcribe", return_value=fake_transcript)
     )
     stack.enter_context(patch("millet.transcribe.ensure_gpu_available"))
-    stack.enter_context(patch("millet.cli._generate_summary", return_value=None))
-    stack.enter_context(patch("millet.cli._generate_pdf"))
+    # Since the 0.10.0 cli/ package split, the helpers live in
+    # millet.cli._helpers and are bound into the millet.cli.transcribe
+    # MODULE namespace at import time — patch them where they are looked
+    # up.  Two traps here (both bit this suite while it was excluded
+    # from CI): the old target `millet.cli._generate_*` no longer exists,
+    # and the dotted string "millet.cli.transcribe" resolves to the Click
+    # *Command* (the package re-exports it, shadowing the submodule), so
+    # we must patch the module object from sys.modules directly.
+    import sys
+
+    import millet.cli  # noqa: F401 — ensure the submodule is imported
+
+    transcribe_mod = sys.modules["millet.cli.transcribe"]
+    stack.enter_context(
+        patch.object(transcribe_mod, "_generate_summary", return_value=None)
+    )
+    stack.enter_context(patch.object(transcribe_mod, "_generate_pdf"))
     return stack
 
 

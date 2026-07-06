@@ -434,6 +434,36 @@ class TestApplyLabels:
         new_text = summary_path.read_text()
         assert "Alice discussed the meeting" in new_text
 
+    def test_find_replace_summary_overlapping_labels(self, session_dir):
+        """Overlapping labels must not corrupt each other: naive dict-order
+        substring replacement turned REMOTE_1 into <REMOTE's name>_1."""
+        summary_path = session_dir / "meeting-20260314-100000.summary.md"
+        summary_path.write_text(
+            "REMOTE said hi. REMOTE_1 agreed. REMOTE_2 disagreed.\n"
+        )
+        # Insertion order deliberately puts the short key first.
+        apply_labels(
+            session_dir,
+            {"REMOTE": "Alice", "REMOTE_1": "Bob", "REMOTE_2": "Carol"},
+            regenerate_summary=False,
+        )
+        new_text = summary_path.read_text()
+        assert "Alice said hi." in new_text
+        assert "Bob agreed." in new_text
+        assert "Carol disagreed." in new_text
+        assert "Alice_1" not in new_text
+        assert "Alice_2" not in new_text
+
+    def test_find_replace_summary_word_boundary(self, session_dir):
+        """A label must only match as a whole word — 'YOU' must not fire
+        inside 'YOUR' (uppercase prose)."""
+        summary_path = session_dir / "meeting-20260314-100000.summary.md"
+        summary_path.write_text("YOU said: BRING YOUR OWN DEVICE.\n")
+        apply_labels(session_dir, {"YOU": "Alice"}, regenerate_summary=False)
+        new_text = summary_path.read_text()
+        assert "Alice said" in new_text
+        assert "YOUR OWN DEVICE" in new_text
+
     def test_accepts_summary_preset_kwarg(self, session_dir):
         """Regression: cli.py `meet label` passes summary_preset= to
         apply_labels().  If the kwarg isn't in the signature, every
@@ -775,3 +805,127 @@ class TestAbsorbTinySpeakers:
                                 text="x", speaker="REMOTE"))
         txn = self._txn(segs)
         assert absorb_tiny_speakers(txn, set()) == {}
+
+
+# ─── millet label --apply-json (non-interactive embedder mode) ──────────────
+
+class TestLabelApplyJson:
+    """The subprocess boundary for embedders (vezir): apply a label map
+    from JSON with no prompting, no audio, no terminal dependence."""
+
+    def _invoke(self, args):
+        from click.testing import CliRunner
+
+        from millet.cli.label import label as label_cmd
+
+        return CliRunner().invoke(label_cmd, args)
+
+    def test_applies_labels_from_file(self, session_dir, tmp_path):
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps({"labels": {"YOU": "Alice"}}))
+        result = self._invoke(
+            [str(session_dir), "--apply-json", str(payload), "--no-summary"]
+        )
+        assert result.exit_code == 0, result.output
+        txt = (session_dir / "meeting-20260314-100000.txt").read_text()
+        assert "Alice:" in txt
+        assert "YOU:" not in txt
+
+    def test_accepts_plain_map_without_envelope(self, session_dir, tmp_path):
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps({"REMOTE_1": "Bob"}))
+        result = self._invoke(
+            [str(session_dir), "--apply-json", str(payload), "--no-summary"]
+        )
+        assert result.exit_code == 0, result.output
+        txt = (session_dir / "meeting-20260314-100000.txt").read_text()
+        assert "Bob:" in txt
+
+    def test_reads_map_from_stdin(self, session_dir):
+        from click.testing import CliRunner
+
+        from millet.cli.label import label as label_cmd
+
+        result = CliRunner().invoke(
+            label_cmd,
+            [str(session_dir), "--apply-json", "-", "--no-summary"],
+            input=json.dumps({"labels": {"YOU": "Alice"}}),
+        )
+        assert result.exit_code == 0, result.output
+        txt = (session_dir / "meeting-20260314-100000.txt").read_text()
+        assert "Alice:" in txt
+
+    def test_never_prompts(self, session_dir, tmp_path):
+        """Even with unlabeled speakers left over, apply-json mode must not
+        touch stdin for prompting (stdin may be closed in the vezir worker)."""
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps({"labels": {"YOU": "Alice"}}))
+        with patch("click.prompt", side_effect=AssertionError("prompted!")):
+            result = self._invoke(
+                [str(session_dir), "--apply-json", str(payload), "--no-summary"]
+            )
+        assert result.exit_code == 0, result.output
+
+    def test_invalid_json_exits_nonzero(self, session_dir, tmp_path):
+        payload = tmp_path / "labels.json"
+        payload.write_text("{not json")
+        result = self._invoke(
+            [str(session_dir), "--apply-json", str(payload), "--no-summary"]
+        )
+        assert result.exit_code == 1
+        assert "could not parse" in result.output
+
+    def test_non_dict_json_exits_nonzero(self, session_dir, tmp_path):
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps(["not", "a", "map"]))
+        result = self._invoke(
+            [str(session_dir), "--apply-json", str(payload), "--no-summary"]
+        )
+        assert result.exit_code == 1
+
+    def test_empty_map_no_summary_is_a_noop(self, session_dir, tmp_path):
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps({"labels": {}}))
+        before = (session_dir / "meeting-20260314-100000.txt").read_text()
+        result = self._invoke(
+            [str(session_dir), "--apply-json", str(payload), "--no-summary"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "No labels to apply" in result.output
+        after = (session_dir / "meeting-20260314-100000.txt").read_text()
+        assert before == after
+
+    def test_apply_failure_exits_nonzero(self, session_dir, tmp_path):
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps({"labels": {"YOU": "Alice"}}))
+        with patch(
+            "millet.label.apply_labels",
+            side_effect=RuntimeError("disk full"),
+        ):
+            result = self._invoke(
+                [str(session_dir), "--apply-json", str(payload), "--no-summary"]
+            )
+        assert result.exit_code == 1
+        assert "apply failed" in result.output
+
+    def test_update_profiles_is_nonfatal_on_failure(self, session_dir, tmp_path):
+        """A voiceprint update failure must not fail the command — labels
+        are already applied at that point (embedder contract)."""
+        payload = tmp_path / "labels.json"
+        payload.write_text(json.dumps({"labels": {"YOU": "Alice"}}))
+        with patch(
+            "millet.voiceprint.update_profiles_from_confirmed_labels",
+            side_effect=RuntimeError("no model"),
+        ):
+            result = self._invoke(
+                [
+                    str(session_dir),
+                    "--apply-json", str(payload),
+                    "--no-summary", "--update-profiles",
+                ]
+            )
+        assert result.exit_code == 0, result.output
+        assert "profile update failed" in result.output
+        # ...but the labels landed.
+        txt = (session_dir / "meeting-20260314-100000.txt").read_text()
+        assert "Alice:" in txt
