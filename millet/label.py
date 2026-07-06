@@ -698,8 +698,21 @@ def apply_labels(
         fm_dict, body = parse_frontmatter_block(raw)
 
         def _replace_all(s: str) -> str:
-            for old_label, new_label in label_map.items():
-                s = s.replace(old_label, new_label)
+            # Longest label first with word boundaries: naive substring
+            # replacement in dict order corrupted overlapping labels
+            # (relabeling REMOTE before REMOTE_1 turned "REMOTE_1" into
+            # "Alice_1"; SPEAKER_1 clobbered the prefix of SPEAKER_10)
+            # and short labels like "YOU" matched uppercase prose.
+            import re as _re
+
+            for old_label, new_label in sorted(
+                label_map.items(), key=lambda kv: len(kv[0]), reverse=True
+            ):
+                # Callable repl: new_label is inserted literally (no
+                # backreference/escape interpretation).
+                s = _re.sub(
+                    rf"\b{_re.escape(old_label)}\b", lambda _m, nl=new_label: nl, s
+                )
             return s
 
         body = _replace_all(body)

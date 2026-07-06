@@ -927,6 +927,11 @@ def _summarize_tinfoil(
             # Client init does a network fetch (router discovery) — keep it
             # inside the retry so a DNS blip here doesn't hard-fail.
             client = TinfoilAI(api_key=api_key)
+            # timeout: the only backend call that previously omitted it —
+            # a stalled TLS connection to the enclave hung the whole
+            # pipeline indefinitely, worst for the `confidential` preset
+            # which (by design) has no fallback. The Tinfoil SDK is
+            # OpenAI-compatible and honors per-request timeouts.
             response = client.chat.completions.create(
                 model=config.model,
                 messages=[
@@ -934,6 +939,7 @@ def _summarize_tinfoil(
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=config.temperature,
+                timeout=config.timeout,
             )
             break
         except Exception as e:
