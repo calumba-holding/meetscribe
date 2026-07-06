@@ -75,6 +75,120 @@ def _write_autoid_sidecar(json_path: Path, auto_matches: dict) -> None:
     )
 
 
+def _apply_json_mode(
+    *,
+    session_path: Path,
+    apply_json: str,
+    no_summary: bool,
+    summary_preset: str | None,
+    summary_backend: str | None,
+    summary_model: str | None,
+    summary_language: str | None,
+    ollama_singlepass: bool,
+    update_profiles: bool,
+    team_profiles_path: Path | None,
+) -> None:
+    """Non-interactive label application from a JSON map.
+
+    This is the subprocess boundary for embedders (vezir): apply a
+    speaker->name map, regenerate outputs, and optionally update the
+    voiceprint DB from the applied labels — all without prompting,
+    audio playback, or any dependence on the caller's terminal.
+
+    Exit codes: 0 on success, 1 on failure (message on stderr).  A
+    profile-update failure is non-fatal (warning only), matching the
+    long-standing embedder behavior.
+    """
+    from millet.label import (
+        _detect_speaker_channels,
+        _find_session_files,
+        _load_transcript,
+        apply_labels,
+    )
+
+    # Load the label map: {"labels": {...}} envelope or a plain map.
+    try:
+        if apply_json == "-":
+            import sys as _sys
+
+            raw = json.loads(_sys.stdin.read() or "{}")
+        else:
+            raw = json.loads(Path(apply_json).read_text(encoding="utf-8") or "{}")
+    except Exception as exc:
+        click.echo(f"Error: could not parse label JSON: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    if isinstance(raw, dict) and isinstance(raw.get("labels"), dict):
+        raw = raw["labels"]
+    if not isinstance(raw, dict):
+        click.echo(
+            "Error: label JSON must be an object map or {'labels': {...}}",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    label_map: dict[str, str] = {}
+    for spk_id, name in raw.items():
+        if isinstance(name, str) and name.strip():
+            label_map[str(spk_id)] = name.strip()
+
+    regenerate_summary = not no_summary
+    if not label_map and not regenerate_summary and not summary_language:
+        click.echo("No labels to apply and no summary regeneration requested.")
+        return
+
+    click.echo(f"Applying {len(label_map)} label(s) (non-interactive)...")
+    try:
+        result_files = apply_labels(
+            session_path,
+            label_map=label_map,
+            regenerate_summary=regenerate_summary,
+            summary_preset=summary_preset,
+            summary_backend=summary_backend,
+            summary_model=summary_model,
+            summary_language=summary_language,
+            ollama_singlepass=ollama_singlepass,
+            progress_callback=lambda msg: click.echo(f"  {msg}"),
+        )
+    except Exception as exc:
+        click.echo(f"Error: apply failed: {exc}", err=True)
+        raise SystemExit(1) from None
+
+    click.echo("Updated files:")
+    for fmt, path in result_files.items():
+        click.echo(f"  {fmt}: {path}")
+
+    if update_profiles and label_map:
+        click.echo("Updating voice profiles from confirmed labels...")
+        try:
+            from millet.voiceprint import update_profiles_from_confirmed_labels
+
+            files = _find_session_files(session_path)
+            wav_path = files.get("wav")
+            json_path = files.get("json")
+            if wav_path and json_path and wav_path.exists():
+                transcript = _load_transcript(json_path)
+                channel_map = _detect_speaker_channels(
+                    wav_path, transcript.segments, transcript.speakers,
+                )
+                update_profiles_from_confirmed_labels(
+                    wav_path,
+                    transcript.segments,
+                    label_map,
+                    channel_map,
+                    profiles_path=team_profiles_path,
+                )
+                click.echo("  Voice profiles updated.")
+            else:
+                click.echo(
+                    "  Skipping profile update (audio or transcript missing).",
+                    err=True,
+                )
+        except Exception as exc:
+            # Non-fatal by contract: labels are already applied.
+            click.echo(f"  Warning: profile update failed: {exc}", err=True)
+
+
 @click.command()
 @click.argument("session_dir", type=click.Path(exists=True))
 @click.option(
@@ -130,7 +244,34 @@ def _write_autoid_sidecar(json_path: Path, auto_matches: dict) -> None:
          "speaker_profiles.json) for auto-label matching and profile "
          "updates, instead of the global DB.",
 )
-def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backend, summary_model, ollama_singlepass, team):
+@click.option(
+    "--apply-json",
+    "apply_json",
+    type=click.Path(exists=True, dir_okay=False, allow_dash=True),
+    default=None,
+    help="Non-interactive mode: apply the speaker->name map from a JSON "
+         "file ({'labels': {...}} or a plain object; '-' reads stdin) and "
+         "regenerate outputs. No prompting, no audio. An empty map with "
+         "summary regeneration enabled just re-runs the summary+PDF step. "
+         "Intended for embedders (vezir) that previously imported millet "
+         "in-process.",
+)
+@click.option(
+    "--summary-language",
+    type=str,
+    default=None,
+    help="Generate the (re)generated summary in this language, saved as an "
+         "additional <base>.summary.<lang>.md next to the primary summary.",
+)
+@click.option(
+    "--update-profiles",
+    is_flag=True,
+    default=False,
+    help="After applying labels from --apply-json, update the voiceprint "
+         "DB from the applied (human-confirmed) labels. Non-fatal on "
+         "failure. Uses --team's DB when given.",
+)
+def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backend, summary_model, ollama_singlepass, team, apply_json, summary_language, update_profiles):
     """Assign real names to speakers in a transcribed session.
 
     \b
@@ -169,6 +310,22 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
     team_profiles_path = paths.profiles_path(team) if team else None
 
     session_path = Path(session_dir)
+
+    # ── Non-interactive apply mode (embedders: vezir) ──
+    if apply_json is not None:
+        _apply_json_mode(
+            session_path=session_path,
+            apply_json=apply_json,
+            no_summary=no_summary,
+            summary_preset=summary_preset,
+            summary_backend=summary_backend,
+            summary_model=summary_model,
+            summary_language=summary_language,
+            ollama_singlepass=ollama_singlepass,
+            update_profiles=update_profiles,
+            team_profiles_path=team_profiles_path,
+        )
+        return
     files = _find_session_files(session_path)
 
     if "json" not in files:
