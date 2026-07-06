@@ -279,7 +279,7 @@ class MeetRecorderWindow(Gtk.Window):
         self._preset_combo = Gtk.ComboBoxText()
         _PRESET_OPTIONS = [
             ("high-quality", "High Quality \u2014 Sonnet 4.6"),
-            ("confidential", "Confidential \u2014 DeepSeek V4 Pro (TEE)"),
+            ("confidential", "Confidential \u2014 GLM-5.2 (TEE)"),
             ("alternative",  "Alternative \u2014 Kimi K2.6"),
         ]
         for pid, plabel in _PRESET_OPTIONS:

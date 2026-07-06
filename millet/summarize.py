@@ -52,7 +52,7 @@ CLAUDEMAX_HEALTH_URL = "http://localhost:3457/health"
 DEFAULT_OPENAI_COMPAT_MODEL = "gpt-4o-mini"
 
 # Tinfoil TEE defaults (hardware-enforced prompt privacy)
-DEFAULT_TINFOIL_MODEL = "deepseek-v4-pro"
+DEFAULT_TINFOIL_MODEL = "glm-5-2"
 TINFOIL_API_KEY_ENV = "TINFOIL_API_KEY"
 _TINFOIL_KEY_FILE = Path.home() / "models" / "tinfoil" / "tinfoil.txt"
 
@@ -81,7 +81,7 @@ FALLBACK_ORDER = ("claudemax", "tinfoil", "openrouter", "ollama")
 
 SUMMARY_PRESETS = {
     "high-quality": {"backend": "claudemax", "model": "claude-sonnet-4-6"},
-    "confidential": {"backend": "tinfoil",  "model": "deepseek-v4-pro"},
+    "confidential": {"backend": "tinfoil",  "model": "glm-5-2"},
     "alternative":  {"backend": "openrouter", "model": "moonshotai/kimi-k2.6"},
 }
 DEFAULT_PRESET = "high-quality"

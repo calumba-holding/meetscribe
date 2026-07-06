@@ -94,7 +94,7 @@ def test_retries_transient_then_succeeds(monkeypatch):
         # Second attempt succeeds.
 
     state = _install_fake_tinfoil(monkeypatch, behavior)
-    cfg = SummaryConfig(backend="tinfoil", model="deepseek-v4-pro")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
     result = sm._summarize_tinfoil("sys", "user", cfg)
     assert state["attempt"] == 2  # retried once
     assert "Meeting Overview" in result.markdown
@@ -106,7 +106,7 @@ def test_persistent_transient_fails_after_max_attempts(monkeypatch):
         raise socket.gaierror(-2, "Name or service not known")
 
     state = _install_fake_tinfoil(monkeypatch, behavior)
-    cfg = SummaryConfig(backend="tinfoil", model="deepseek-v4-pro")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
     with pytest.raises(RuntimeError, match="unreachable after"):
         sm._summarize_tinfoil("sys", "user", cfg)
     assert state["attempt"] == sm._TINFOIL_MAX_ATTEMPTS  # all attempts used
@@ -118,7 +118,7 @@ def test_completion_call_passes_timeout(monkeypatch):
     enclave hung the pipeline forever, worst for the no-fallback
     `confidential` preset."""
     state = _install_fake_tinfoil(monkeypatch, lambda attempt: None)
-    cfg = SummaryConfig(backend="tinfoil", model="deepseek-v4-pro")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
     sm._summarize_tinfoil("sys", "user", cfg)
     assert state["create_kwargs"].get("timeout") == cfg.timeout
     assert cfg.timeout and cfg.timeout > 0
@@ -129,7 +129,7 @@ def test_auth_error_fails_fast_no_retry(monkeypatch):
         raise RuntimeError("401 Unauthorized: invalid API key")
 
     state = _install_fake_tinfoil(monkeypatch, behavior)
-    cfg = SummaryConfig(backend="tinfoil", model="deepseek-v4-pro")
+    cfg = SummaryConfig(backend="tinfoil", model="glm-5-2")
     with pytest.raises(RuntimeError, match="Tinfoil TEE API error"):
         sm._summarize_tinfoil("sys", "user", cfg)
     assert state["attempt"] == 1  # no retry on a real auth error

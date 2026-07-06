@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.13.1 — `confidential` preset model migration (DeepSeek V4 Pro → GLM-5.2)
+
+Tinfoil deprecated `deepseek-v4-pro` (the model behind the
+`confidential` TEE summarization preset), effective 2026-07-03.  The
+preset now targets **GLM-5.2** (`glm-5-2`), Tinfoil's recommended
+successor.  Verified equal-or-better summarization quality via a
+side-by-side TEE eval on two real meetings — GLM-5.2 matched or beat
+DeepSeek V4 Pro on topic coverage, action-item extraction, and the
+hard-to-catch **Open Questions** section (8 vs 7), with no
+hallucinations.  Same Tinfoil price tier; no fallback-behavior change
+(the `confidential` preset still fails loud, never silently).  Test
+count unchanged (284).
+
+### Changed
+
+* **`confidential` preset → `glm-5-2`.**  `DEFAULT_TINFOIL_MODEL` and
+  `SUMMARY_PRESETS["confidential"]` in `millet/summarize.py`, the GUI
+  preset dropdown label, and the docs (README, REQUIREMENTS) now
+  reference GLM-5.2 instead of DeepSeek V4 Pro.  No API, CLI-flag, or
+  preset-name change — existing `--summary-preset confidential`
+  invocations are unaffected.
+
 ## v0.13.0 — sync security/correctness fixes, `label --apply-json` embedder mode
 
 Fixes from the 2026-07 ecosystem review, plus a new non-interactive
