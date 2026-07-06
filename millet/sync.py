@@ -12,14 +12,53 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# ─── Credential redaction ────────────────────────────────────────────────────
+
+# Matches the userinfo part of URLs like https://user:token@github.com/...
+# so git credentials embedded in a repo_url never leak into exceptions,
+# progress messages, or (via the vezir worker) job logs.
+_URL_USERINFO_RE = re.compile(r"://[^/@\s]+@")
+
+
+def _redact(text: str) -> str:
+    """Strip credentials (``user:token@``) from URLs embedded in *text*."""
+    return _URL_USERINFO_RE.sub("://***@", text)
+
+
+# ─── Folder slug validation ──────────────────────────────────────────────────
+
+# A meeting folder must be a single safe path segment: it is joined into
+# the clone as ``meetings/<date>_<folder>``, and both the CLI
+# (--meeting-type) and sync_config.json ("folder") feed it.  Without
+# validation a value like ``../../foo`` copies meeting artifacts OUTSIDE
+# the clone before git even sees them.  Mirrors the defensive-slug
+# convention in millet.paths (_TEAM_SLUG_RE).
+_FOLDER_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _validate_folder_slug(folder: str, source: str) -> str:
+    """Return *folder* if it is a safe single path segment, else raise.
+
+    ``source`` names where the value came from (CLI flag, config key) so
+    the error is actionable.
+    """
+    if not _FOLDER_SLUG_RE.match(folder or ""):
+        raise RuntimeError(
+            f"Invalid meeting folder {folder!r} from {source}: must be a "
+            "single path segment (letters, digits, '.', '_', '-'; must "
+            "start with a letter or digit; max 64 chars)."
+        )
+    return folder
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -309,17 +348,14 @@ def detect_meeting_type(
             return None
         title = (meta.get("title") or "").strip()
         title_slug = _meeting_slug(title) if title else ""
-        # Parse ISO format — may or may not have timezone info
+        # Parse ISO format — may or may not have timezone info.
+        # Naive datetimes are treated as local time; astimezone() applies
+        # the correct DST-aware local offset (the previous manual
+        # time.timezone arithmetic used the non-DST offset year-round,
+        # shifting every summer-time meeting by an hour and silently
+        # missing the schedule window).
         started_at = datetime.fromisoformat(started_at_str)
-        # Treat naive datetimes as local time, convert to UTC
-        if started_at.tzinfo is None:
-            import time as _time
-
-            local_offset = timedelta(seconds=-_time.timezone)
-            started_at = started_at - local_offset
-            started_at = started_at.replace(tzinfo=timezone.utc)
-        else:
-            started_at = started_at.astimezone(timezone.utc)
+        started_at = started_at.astimezone(timezone.utc)
     except Exception as exc:
         log.debug("Could not parse session start time: %s", exc)
         return None
@@ -335,7 +371,11 @@ def detect_meeting_type(
             continue
         scheduled_minutes = m["hour_utc"] * 60
         window = m.get("window_minutes", 60)
-        if abs(meeting_minutes - scheduled_minutes) > window:
+        # Wrap around midnight: a 23:40 UTC session is 20 minutes from an
+        # hour_utc=0 schedule, not 1420.
+        diff = abs(meeting_minutes - scheduled_minutes)
+        diff = min(diff, 1440 - diff)
+        if diff > window:
             continue
         # Title-aware guard: a titled session only matches a schedule whose
         # name/folder slug equals the title's slug.  An ad-hoc titled meeting
@@ -372,10 +412,14 @@ def _run(
     """Run a command, raising on non-zero exit if check=True."""
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if check and result.returncode != 0:
+        # _redact: never leak repo_url credentials into exception text
+        # (which the vezir worker captures into job logs).
         raise RuntimeError(
-            f"Command failed: {' '.join(cmd)}\n"
-            f"stdout: {result.stdout.strip()}\n"
-            f"stderr: {result.stderr.strip()}"
+            _redact(
+                f"Command failed: {' '.join(cmd)}\n"
+                f"stdout: {result.stdout.strip()}\n"
+                f"stderr: {result.stderr.strip()}"
+            )
         )
     return result
 
@@ -432,9 +476,11 @@ def _run_network(
 
     assert last_result is not None
     raise RuntimeError(
-        f"Command failed: {' '.join(cmd)}\n"
-        f"stdout: {last_result.stdout.strip()}\n"
-        f"stderr: {last_result.stderr.strip()}"
+        _redact(
+            f"Command failed: {' '.join(cmd)}\n"
+            f"stdout: {last_result.stdout.strip()}\n"
+            f"stderr: {last_result.stderr.strip()}"
+        )
     )
 
 
@@ -528,7 +574,7 @@ def ensure_repo_cloned(progress_callback=None, team: str | None = None) -> Path:
             log.info(msg)
 
     if not clone_dir.exists():
-        _log(f"Cloning {repo_url}...")
+        _log(f"Cloning {_redact(repo_url)}...")
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         _run_network(["git", "clone", repo_url, str(clone_dir)])
         _log("Clone complete.")
@@ -547,7 +593,15 @@ def ensure_repo_cloned(progress_callback=None, team: str | None = None) -> Path:
             )
 
         # Pull latest, rebasing any previously-created local meeting commits.
-        _run_network(["git", "pull", "--rebase"], cwd=clone_dir)
+        # On failure, abort any half-applied rebase: a conflicting pull
+        # leaves .git/rebase-merge behind, which would wedge every future
+        # sync at the uncommitted-changes guard above with an error that
+        # never mentions the rebase.
+        try:
+            _run_network(["git", "pull", "--rebase"], cwd=clone_dir)
+        except Exception:
+            _run(["git", "rebase", "--abort"], cwd=clone_dir, check=False)
+            raise
 
     return clone_dir
 
@@ -557,8 +611,14 @@ def _collect_files(session_dir: Path) -> list[tuple[Path, str]]:
 
     Files are renamed to descriptive names (summary.md, transcript.txt, etc.)
     since the date lives in the parent folder name.
+
+    Collision-safe: if two source files map to the same descriptive name
+    (e.g. a stray ``notes.md`` next to the real summary), later files keep
+    their original names instead of silently clobbering the earlier one in
+    the pushed repo.
     """
     result = []
+    used_names: set[str] = set()
     for f in sorted(session_dir.iterdir()):
         if not f.is_file():
             continue
@@ -588,6 +648,14 @@ def _collect_files(session_dir: Path) -> list[tuple[Path, str]]:
             dest_name = "transcript.json"
         else:
             dest_name = f.name  # fallback: keep original name
+
+        if dest_name in used_names:
+            log.warning(
+                "sync: %s also maps to %s — keeping its original name to "
+                "avoid overwriting", f.name, dest_name,
+            )
+            dest_name = f.name
+        used_names.add(dest_name)
 
         result.append((f, dest_name))
     return result
@@ -681,6 +749,11 @@ def sync_session(
             progress_callback(msg)
         else:
             log.info(msg)
+
+    # Defense in depth: the folder feeds a path join below; reject
+    # traversal-capable values whether they came from --meeting-type or a
+    # hostile/corrupt sync_config.json.
+    _validate_folder_slug(meeting_type.folder, "meeting type/config folder")
 
     repo = ensure_repo_cloned(progress_callback=progress_callback, team=team)
 
@@ -781,5 +854,8 @@ def maybe_sync_session(
     except Exception as exc:
         _log(f"Sync failed (meeting saved locally): {exc}")
         log.exception("Sync failed for %s", session_dir)
+        # A failed push must not be reported as synced: callers (GUI
+        # auto-sync) treat a non-None return as success.
+        return None
 
     return candidate.match

@@ -68,12 +68,23 @@ def sync(session_dirs, force, meeting_type, list_schedule, init_config, team):
         EXAMPLE_CONFIG,
         MeetingMatch,
         _resolve_sync_config_path,
+        _validate_folder_slug,
         detect_meeting_type,
         is_sync_configured,
         load_sync_config,
         save_sync_config,
         sync_session,
     )
+
+    if meeting_type:
+        # Fail fast with a friendly message before touching any session:
+        # the folder becomes a path segment inside the sync repo, so
+        # traversal-capable values ('../..', absolute paths) are rejected.
+        try:
+            _validate_folder_slug(meeting_type, "--meeting-type")
+        except RuntimeError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            raise SystemExit(1) from None
 
     config_path = _resolve_sync_config_path(team)
 
