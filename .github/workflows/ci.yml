@@ -34,8 +34,11 @@ jobs:
               r'^version\s*=\s*"([^"]+)"', open("pyproject.toml").read(), re.M
           )
           proj = proj_m.group(1) if proj_m else "<missing>"
+          # \s* prefix: the literal fallback assignment is indented inside
+          # the PackageNotFoundError handler; the unquoted _pkg_version()
+          # assignments above it can't match the quoted capture.
           init_m = re.search(
-              r'^__version__\s*=\s*"([^"]+)"', open("millet/__init__.py").read(), re.M
+              r'^\s*__version__\s*=\s*"([^"]+)"', open("millet/__init__.py").read(), re.M
           )
           init = init_m.group(1) if init_m else "<missing>"
           if proj != init or proj == "<missing>":
