@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.13.0 — sync security/correctness fixes, `label --apply-json` embedder mode
+
+Fixes from the 2026-07 ecosystem review, plus a new non-interactive
+label-apply mode that gives embedders (vezir ≥ 0.11.0) a proper
+subprocess boundary.  Focused CI suite grows 251 → 284 tests and now
+runs on a 3.10/3.11/3.12 matrix with a pyproject↔`__init__` version
+gate.
+
+### Added
+
+* **`millet label SESSION --apply-json FILE`** — non-interactive apply
+  mode: applies a speaker→name map from JSON (`{"labels": {...}}` or a
+  plain object; `-` reads stdin) with no prompting, no audio, no
+  terminal dependence.  An empty map with summary regeneration enabled
+  just re-runs the summary+PDF step (vezir's retry-summary path).  New
+  companions: `--summary-language LANG` (additional-language summary)
+  and `--update-profiles` (voiceprint update from the applied labels;
+  non-fatal on failure).  This is the sanctioned boundary for vezir,
+  which previously imported `millet.label` in-process and mutated
+  `os.environ["HOME"]` around the call — racing every other thread in
+  the server process.
+
+### Fixed
+
+* **`maybe_sync_session` no longer reports a failed push as synced.**
+  The exception branch logged the failure and then returned the match
+  anyway; GUI auto-sync treated failed pushes as success.  Now returns
+  `None`.
+* **Path traversal via `--meeting-type` / config `folder` closed.**
+  The folder becomes a path segment in `meetings/<date>_<folder>`; a
+  value like `../../foo` copied meeting artifacts *outside* the clone
+  before git ever saw them.  New `_validate_folder_slug` (mirroring the
+  `paths.py` team-slug convention) is enforced in `sync_session` and at
+  the CLI with an early, friendly error.
+* **Git credentials no longer leak into errors and logs.**  A
+  `repo_url` like `https://user:TOKEN@github.com/...` appeared verbatim
+  in `Command failed:` RuntimeErrors (which the vezir worker captures
+  into job logs) and in the `Cloning ...` progress line.  URL userinfo
+  is now redacted (`://***@`) everywhere failures are formatted.
+* **A failed `git pull --rebase` no longer wedges the clone.**  A
+  conflicting rebase left `.git/rebase-merge` behind, so every later
+  sync died at the uncommitted-changes guard with an error that never
+  mentioned the rebase.  The pull path now runs `git rebase --abort`
+  before re-raising.
+* **DST-aware schedule matching.**  Naive `started_at` timestamps were
+  converted to UTC with the non-DST `time.timezone` offset year-round,
+  shifting every summer-time meeting by an hour and silently missing
+  the schedule window.  Now uses `astimezone()` (correct local offset).
+* **Schedule window wraps midnight.**  A 23:40 UTC session is 20
+  minutes from an `hour_utc: 0` schedule, not 1420.
+* **`_collect_files` no longer silently overwrites artifacts.**  Any
+  extra `.md`/`.txt`/`.pdf` in a session dir mapped onto `summary.md` /
+  `transcript.txt` / `transcript.pdf` and clobbered the real artifact
+  in the pushed repo.  Colliding files now keep their original names.
+* **Tinfoil completion call gets a timeout.**  It was the only backend
+  call omitting `timeout=config.timeout`; a stalled TLS connection to
+  the enclave hung the pipeline forever — worst for the
+  `confidential` preset, which by design has no fallback.
+* **Speaker relabel is substring-safe.**  Summary find-and-replace now
+  applies the label map longest-key-first with word-boundary regexes;
+  naive dict-order replacement corrupted overlapping labels (`REMOTE`
+  before `REMOTE_1` produced `Alice_1`) and matched short labels like
+  `YOU` inside uppercase prose.
+* **`tests/test_cli.py` had been silently broken since the 0.10.0
+  `cli/` package split** (patched helpers at their pre-split location;
+  all 3 tests failed with AttributeError while excluded from CI).
+  Fixed and added to CI, along with `test_parakeet.py` (mocked, no
+  torch needed) and the new `test_sync_core.py`.
+
 ## v0.12.16 — transcribe: fail loudly on multiple files in a directory
 
 ### Changed
