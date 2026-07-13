@@ -11,6 +11,28 @@ from ._helpers import (
 )
 
 
+def _echo_offline_model_help(model: str, audio_file: str) -> None:
+    """Print actionable guidance for an offline model-cache miss."""
+    click.echo()
+    click.echo(
+        click.style(
+            f"Error: model '{model}' is not in the local cache and Hugging Face "
+            "downloads are disabled (HF_HUB_OFFLINE is set).",
+            fg="red",
+        ),
+        err=True,
+    )
+    click.echo(err=True)
+    click.echo("  Cache the model once with downloads enabled, then retry:", err=True)
+    click.echo(f"    HF_HUB_OFFLINE=0 meet transcribe {audio_file}", err=True)
+    click.echo(err=True)
+    click.echo("  Or pre-download it, e.g.:", err=True)
+    click.echo(
+        f"    HF_HUB_OFFLINE=0 hf download {model}",
+        err=True,
+    )
+
+
 @click.command()
 @click.argument("audio_file", type=click.Path(exists=True))
 @click.option(
@@ -235,6 +257,7 @@ def transcribe(
     """Transcribe a recorded audio file with speaker diarization."""
     from millet.transcribe import (
         AlignmentModelMissing,
+        OfflineModelMissing,
         TranscriptionConfig,
         ensure_gpu_available,
     )
@@ -345,6 +368,18 @@ def transcribe(
             err=True,
         )
         raise SystemExit(1) from None
+    except OfflineModelMissing as exc:
+        _echo_offline_model_help(exc.model, audio_file)
+        raise SystemExit(1) from None
+    except Exception as exc:
+        # huggingface_hub raises LocalEntryNotFoundError when a model is not in
+        # the local cache and downloads are disabled.  Catch it by name so we
+        # avoid importing huggingface_hub at module load, and translate it into
+        # the same actionable guidance rather than dumping a raw traceback.
+        if type(exc).__name__ == "LocalEntryNotFoundError":
+            _echo_offline_model_help(config.mlx_model or config.model, audio_file)
+            raise SystemExit(1) from None
+        raise
 
     # Determine output directory
     if output_dir is None:

@@ -715,6 +715,100 @@ class TestMlxAsrBackend:
         )
 
 
+class TestOfflineModelMissing:
+    def test_hf_offline_detects_env(self, monkeypatch):
+        from millet.transcribe import _hf_offline
+
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+        monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+        assert _hf_offline() is False
+
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        assert _hf_offline() is True
+
+        monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+        monkeypatch.setenv("TRANSFORMERS_OFFLINE", "true")
+        assert _hf_offline() is True
+
+    def test_offline_uncached_raises_offline_model_missing(self, monkeypatch):
+        from millet.transcribe import OfflineModelMissing
+
+        called = {"transcribe": False}
+
+        class FakeMlxWhisper:
+            @staticmethod
+            def transcribe(audio, **kwargs):
+                called["transcribe"] = True
+                return {"text": "", "language": "en", "segments": []}
+
+        monkeypatch.setitem(sys.modules, "mlx_whisper", FakeMlxWhisper)
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        monkeypatch.setattr("millet.transcribe._mlx_model_cached", lambda repo: False)
+
+        config = TranscriptionConfig(
+            asr_backend="mlx",
+            model="large-v3-turbo",
+            mlx_model="mlx-community/whisper-large-v3-turbo",
+        )
+
+        with pytest.raises(OfflineModelMissing) as exc_info:
+            _transcribe_asr("audio.wav", config, "en")
+
+        assert exc_info.value.model == "mlx-community/whisper-large-v3-turbo"
+        assert exc_info.value.backend == "mlx"
+        # The pre-flight must short-circuit before invoking mlx_whisper.
+        assert called["transcribe"] is False
+
+    def test_offline_cached_proceeds_to_transcribe(self, monkeypatch):
+        class FakeMlxWhisper:
+            @staticmethod
+            def transcribe(audio, **kwargs):
+                return {
+                    "text": " hi",
+                    "language": "en",
+                    "segments": [{"start": 0, "end": 1.0, "text": " hi"}],
+                }
+
+        monkeypatch.setitem(sys.modules, "mlx_whisper", FakeMlxWhisper)
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        monkeypatch.setattr("millet.transcribe._mlx_model_cached", lambda repo: True)
+
+        config = TranscriptionConfig(
+            asr_backend="mlx",
+            model="large-v3-turbo",
+            mlx_model="test/model",
+        )
+
+        result = _transcribe_asr("audio.wav", config, "en")
+        assert result["text"] == " hi"
+
+    def test_online_skips_cache_preflight(self, monkeypatch):
+        class FakeMlxWhisper:
+            @staticmethod
+            def transcribe(audio, **kwargs):
+                return {"text": " ok", "language": "en", "segments": []}
+
+        monkeypatch.setitem(sys.modules, "mlx_whisper", FakeMlxWhisper)
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+        monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+
+        # Even if the model is not cached, online mode must not pre-empt: it
+        # should proceed and let mlx_whisper download as usual.
+        def _fail_if_called(repo):
+            raise AssertionError("cache preflight ran while online")
+
+        monkeypatch.setattr("millet.transcribe._mlx_model_cached", _fail_if_called)
+
+        config = TranscriptionConfig(
+            asr_backend="mlx",
+            model="large-v3-turbo",
+            mlx_model="test/model",
+        )
+
+        result = _transcribe_asr("audio.wav", config, "en")
+        assert result["text"] == " ok"
+
+
 class TestWhisperXAsrBackend:
     def test_dual_channel_reuses_whisperx_model(self, monkeypatch, tmp_path):
         mic_path = tmp_path / "mic.wav"

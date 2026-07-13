@@ -261,6 +261,61 @@ class AlignmentModelMissing(Exception):
         )
 
 
+class OfflineModelMissing(Exception):
+    """Raised when an ASR model is not cached locally and downloads are disabled.
+
+    Occurs when ``HF_HUB_OFFLINE`` (or ``TRANSFORMERS_OFFLINE``) is set but the
+    requested Hugging Face model has never been cached, so huggingface_hub
+    refuses to fetch it.  Carries the resolved model repo so CLI/GUI can show
+    actionable guidance instead of a raw traceback.
+    """
+
+    def __init__(self, model: str, backend: str = "mlx"):
+        self.model = model
+        self.backend = backend
+        super().__init__(
+            f"{backend} model '{model}' is not cached locally and Hugging Face "
+            f"downloads are disabled (HF_HUB_OFFLINE is set)."
+        )
+
+
+def _hf_offline() -> bool:
+    """Return True if Hugging Face downloads are disabled via env vars."""
+    return any(
+        os.environ.get(var, "").strip().lower() in {"1", "true", "yes", "on"}
+        for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    )
+
+
+def _mlx_model_cached(repo: str) -> bool:
+    """Best-effort check whether an MLX/HF model repo is in the local cache.
+
+    Purely a filesystem check via huggingface_hub; never downloads.  Returns
+    True when the check cannot be performed (so we fall through to the real
+    load and let it raise its own error rather than blocking a valid run).
+    """
+    # A local path (not a "org/repo" HF id) is used directly by mlx_whisper.
+    if os.path.sep in repo and Path(repo).exists():
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+    except Exception:
+        return True
+    try:
+        from huggingface_hub import scan_cache_dir
+
+        cache = scan_cache_dir(HUGGINGFACE_HUB_CACHE)
+        return any(r.repo_id == repo for r in cache.repos)
+    except Exception:
+        # Fallback: probe for the model config file specifically.
+        try:
+            hit = try_to_load_from_cache(repo, "config.json")
+            return isinstance(hit, str)
+        except Exception:
+            return True
+
+
 def check_alignment_model_cached(lang: str) -> bool:
     """Check if the alignment model for *lang* is cached locally.
 
@@ -1102,6 +1157,8 @@ def _transcribe_asr(
             _mlx_vad_note_logged = True
 
         print(f"  Loading MLX model: {config.mlx_model}")
+        if _hf_offline() and not _mlx_model_cached(config.mlx_model):
+            raise OfflineModelMissing(config.mlx_model, backend="mlx")
         decode_options = {}
         if language is not None:
             decode_options["language"] = language

@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.13.2 — actionable error for offline MLX model-cache miss
+
+When `HF_HUB_OFFLINE` (or `TRANSFORMERS_OFFLINE`) is set and the MLX
+Whisper model has never been cached, `mlx_whisper` bubbled a raw
+`huggingface_hub.errors.LocalEntryNotFoundError` traceback and
+`millet transcribe` exited 1 with no guidance.  This was hit in the
+field on a macOS/Apple-Silicon client (offline env + empty MLX cache).
+The transcribe path now detects the offline cache-miss and prints
+actionable remediation instead of a traceback.  Focused CI suite grows
+284 → 288 tests.
+
+### Added
+
+* **`OfflineModelMissing`** exception (`millet/transcribe.py`), plus
+  `_hf_offline()` and `_mlx_model_cached()` helpers.  The MLX branch of
+  `_transcribe_asr` pre-flights the Hugging Face cache when offline mode
+  is enabled and raises `OfflineModelMissing` (carrying the resolved
+  model repo) before invoking `mlx_whisper`, mirroring the existing
+  `AlignmentModelMissing` pattern.
+* **CLI guidance** (`millet/cli/transcribe.py`): `millet transcribe` now
+  catches `OfflineModelMissing` — and, defensively, any
+  `LocalEntryNotFoundError` by name — and prints how to warm the cache
+  (`HF_HUB_OFFLINE=0 meet transcribe …` or `hf download <model>`) before
+  exiting 1.  Online runs are unaffected: the pre-flight only runs when
+  offline mode is set, so normal first-run downloads still work.
+
 ## v0.13.1 — `confidential` preset model migration (DeepSeek V4 Pro → GLM-5.2)
 
 Tinfoil deprecated `deepseek-v4-pro` (the model behind the
