@@ -75,6 +75,7 @@ import numpy as np  # noqa: E402
 from millet import voiceprint as _vp  # noqa: E402
 from millet.transcribe import Segment, Speaker  # noqa: E402
 from millet.voiceprint import (  # noqa: E402
+    MATCH_MANY_TO_ONE_CONFIDENCE,
     SpeakerProfile,
     identify_speakers,
 )
@@ -152,9 +153,9 @@ def test_secondary_cluster_below_autoapply_stays_unmatched(monkeypatch):
     folded on (stays raw → human review), guarding against over-merge."""
     destiny = _unit(1.0, 0.0, 0.0)
     # Second 'Destiny-ish' cluster at ~0.66 cosine: above MATCH_THRESHOLD (0.65)
-    # but below MATCH_AUTOAPPLY_CONFIDENCE (0.72) → not auto-folded.
+    # but below the many-to-one fold floor → not auto-folded.
     weak = _unit(0.66, 0.751, 0.0)
-    assert float(np.dot(weak, destiny)) < MATCH_AUTOAPPLY_CONFIDENCE
+    assert float(np.dot(weak, destiny)) < MATCH_MANY_TO_ONE_CONFIDENCE
     matches = _run_identify(
         monkeypatch,
         cluster_embeddings={
@@ -165,6 +166,67 @@ def test_secondary_cluster_below_autoapply_stays_unmatched(monkeypatch):
     )
     assert matches["SPEAKER_00"].name == "Destiny"
     assert "SPEAKER_01" not in matches
+
+
+# ─── many-to-one "different person" guard (0.13.3) ───────────────────────────
+# Regression: two DIFFERENT people on the same compressed system channel,
+# speaking in non-overlapping turns, where only ONE is enrolled.  Pass 1 names
+# the enrolled person's cluster; the unenrolled person's cluster (a NEW founder
+# with no profile) is left unmatched, then Pass 2 used to FOLD it onto the
+# enrolled profile whenever the cross-voice cosine merely cleared 0.72 — mixing
+# two people into one name (field case: Humphrey mislabeled "Bright").  Pass 2
+# now requires a higher absolute floor (MATCH_MANY_TO_ONE_CONFIDENCE) AND a
+# clear runner-up margin, so a similar-but-distinct voice is NOT folded.
+
+
+def test_distinct_similar_voice_not_folded_onto_named_profile(monkeypatch):
+    """New person resembling an enrolled profile at ~0.74 (no runner-up margin)
+    is NOT folded — stays raw for human review (the Humphrey→Bright case)."""
+    bright = _unit(1.0, 0.0, 0.0)
+    # Humphrey: a distinct voice that lands at ~0.74 cosine to Bright — above
+    # the ordinary auto-apply floor (0.72) but below the stricter fold floor.
+    humphrey = _unit(0.74, 0.6726, 0.0)
+    score = float(np.dot(humphrey, bright))
+    assert 0.72 <= score < MATCH_MANY_TO_ONE_CONFIDENCE
+    matches = _run_identify(
+        monkeypatch,
+        cluster_embeddings={
+            "SPEAKER_06": bright,      # enrolled Bright
+            "SPEAKER_08": humphrey,    # new, unenrolled — must NOT become Bright
+        },
+        profiles={"Bright": SpeakerProfile("Bright", bright, 3)},
+    )
+    assert matches["SPEAKER_06"].name == "Bright"
+    assert "SPEAKER_08" not in matches
+
+
+def test_high_confidence_fold_needs_margin(monkeypatch):
+    """Even a high absolute score does not fold when the cluster resembles a
+    SECOND profile nearly as much (small runner-up margin = ambiguous)."""
+    bright = _unit(1.0, 0.0, 0.0)
+    other = _unit(0.85, 0.5268, 0.0)   # a second enrolled profile, close to Bright
+    # A leftover cluster that scores ~0.90 to Bright but ~0.88 to `other`:
+    # high absolute confidence, tiny margin → ambiguous, must stay raw.
+    amb = _unit(0.94, 0.32, 0.0)
+    top = max(float(np.dot(amb, bright)), float(np.dot(amb, other)))
+    second = min(float(np.dot(amb, bright)), float(np.dot(amb, other)))
+    assert top >= MATCH_MANY_TO_ONE_CONFIDENCE
+    assert (top - second) < 0.15  # below MATCH_AUTOAPPLY_MARGIN
+    matches = _run_identify(
+        monkeypatch,
+        cluster_embeddings={
+            "SPEAKER_00": bright,      # claims Bright (exact)
+            "SPEAKER_01": other,       # claims Other (exact)
+            "SPEAKER_02": amb,         # ambiguous leftover
+        },
+        profiles={
+            "Bright": SpeakerProfile("Bright", bright, 3),
+            "Other": SpeakerProfile("Other", other, 3),
+        },
+    )
+    assert matches["SPEAKER_00"].name == "Bright"
+    assert matches["SPEAKER_01"].name == "Other"
+    assert "SPEAKER_02" not in matches
 
 
 def test_single_cluster_per_profile_unchanged(monkeypatch):

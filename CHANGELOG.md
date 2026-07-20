@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.13.3 — voiceprint many-to-one fold no longer merges two people
+
+The `--auto` labeler could silently attribute one person's turns to a
+DIFFERENT, already-named person.  Field case: a new founder ("Humphrey")
+whose diarization cluster was correctly separated got labeled as an
+existing, enrolled participant ("Bright"), because both spoke on the same
+compressed system (Bluetooth) channel in non-overlapping turns and their
+voice embeddings landed just over the auto-apply floor.
+
+Root cause is the **Pass-2 "many-to-one" fold** in `identify_speakers`
+(added in 0.12.11 to reunite ONE over-segmented person's clusters).  It
+folded any still-unmatched cluster onto an already-claimed profile as long
+as the cross-voice cosine cleared `MATCH_AUTOAPPLY_CONFIDENCE` (0.72) —
+too low to distinguish "same person, split by mic/volume drift" from "two
+similar-but-distinct voices on a lossy channel".  A new, unenrolled speaker
+with no profile of their own was the exact trigger: Pass 1 left them
+unmatched, then Pass 2 absorbed them into the nearest enrolled name.
+
+### Fixed
+
+* **`millet/voiceprint.py`** — Pass 2 now requires a STRICTER bar before
+  folding onto an already-named identity: a new
+  `MATCH_MANY_TO_ONE_CONFIDENCE = 0.80` absolute floor **and** a clear
+  runner-up margin (`>= MATCH_AUTOAPPLY_MARGIN`, 0.15) over the cluster's
+  own second-best profile.  A genuine over-segmentation of one person
+  clears both trivially (the cluster looks overwhelmingly like that one
+  profile); two distinct voices do not, so the unmatched cluster stays raw
+  and routes to `needs_labeling` for a human — no silent mis-merge.  Pass 1
+  (fresh 1:1 matching) is unchanged.
+
+### Tests
+
+* Three new regressions in `tests/test_voiceprint_gate.py`: a
+  distinct-but-similar voice (~0.74 cosine) is NOT folded onto an enrolled
+  profile; a high-confidence-but-ambiguous (small-margin) leftover is NOT
+  folded; and the existing genuine over-segmentation case still folds both
+  clusters into one name.
+
 ## v0.13.2 — actionable error for offline MLX model-cache miss
 
 When `HF_HUB_OFFLINE` (or `TRANSFORMERS_OFFLINE`) is set and the MLX

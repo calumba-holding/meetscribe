@@ -76,6 +76,20 @@ MATCH_MIN_SPEECH_SECONDS = 4.0
 # well-separated matches (e.g. 0.93 with a 0.40 margin).
 MATCH_AUTOAPPLY_CONFIDENCE = 0.72
 MATCH_AUTOAPPLY_MARGIN = 0.15
+# Pass-2 many-to-one folding (see identify_speakers) is HIGHER RISK than a
+# pass-1 1:1 match: it attaches a still-unmatched cluster to a profile that is
+# ALREADY claimed by another cluster, on the assumption that diarization
+# over-segmented ONE person.  That assumption fails when two DIFFERENT people
+# (e.g. two new founders on the same compressed system channel, speaking in
+# non-overlapping turns) each resemble the same enrolled profile just enough to
+# clear the ordinary auto-apply floor — the fold then silently merges two
+# people into one name.  Folding therefore requires a STRICTER bar than a fresh
+# 1:1 match: a higher absolute confidence AND a clear margin over the cluster's
+# own runner-up profile (a small margin is the ambiguous-cluster signature).
+# A genuine over-segmentation of one person clears both easily (the cluster
+# looks overwhelmingly like that one profile); two similar-but-distinct voices
+# do not.
+MATCH_MANY_TO_ONE_CONFIDENCE = 0.80
 # Empirically tuned floor for embedding extraction.
 #
 # The purpose of this gate is to reject TRUE silence — clips where the
@@ -681,27 +695,37 @@ def identify_speakers(
 
     # ── Pass 2: many-to-one for confident leftover clusters ──
     # A still-unmatched cluster may join an already-claimed profile if that
-    # profile is its top match and the score is confident on its own.  We reuse
-    # the auto-apply confidence floor so this never auto-merges an ambiguous
-    # cluster (those stay raw and route to human review, unchanged).
+    # profile is its top match AND the fold clears the STRICTER many-to-one bar
+    # (a higher absolute confidence AND a clear runner-up margin — see
+    # MATCH_MANY_TO_ONE_CONFIDENCE).  This never auto-merges an ambiguous
+    # cluster or two distinct-but-similar voices; those stay raw and route to
+    # human review.  Brand-new identities are left to pass 1 / human review.
     for s_idx in range(sim_matrix.shape[0]):
         speaker_id = speaker_ids[s_idx]
         if speaker_id in matches:
             continue
         p_idx = int(np.argmax(sim_matrix[s_idx]))
         score = float(sim_matrix[s_idx, p_idx])
-        # Only fold onto an EXISTING (already-claimed) identity, and only when
-        # confident enough to auto-apply outright.  Brand-new identities are
-        # left to pass 1 / human review.
+        margin = row_margin.get(int(s_idx), 1.0)
+        # Only fold onto an EXISTING (already-claimed) identity.
         if p_idx not in used_profiles:
             continue
-        if score < MATCH_AUTOAPPLY_CONFIDENCE:
+        # Higher-confidence floor for the fold: attaching to a person who is
+        # already named is riskier than a fresh 1:1 match, so require a genuine
+        # over-segmentation signature (very high score) rather than a merely
+        # auto-appliable one.
+        if score < MATCH_MANY_TO_ONE_CONFIDENCE:
+            continue
+        # Clear separation from the cluster's OWN runner-up profile.  A small
+        # margin means the cluster resembles another profile nearly as much —
+        # the ambiguous / two-different-people signature — so don't fold.
+        if margin < MATCH_AUTOAPPLY_MARGIN:
             continue
         matches[speaker_id] = SpeakerMatch(
             name=profile_names[p_idx],
             confidence=score,
             evidence_seconds=evidence_seconds.get(speaker_id, 0.0),
-            margin=row_margin.get(int(s_idx), 1.0),
+            margin=margin,
         )
 
     return matches
