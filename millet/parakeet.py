@@ -256,10 +256,17 @@ def ensure_parakeet_cached(model: str | None = None) -> bool:
     """
     from pathlib import Path
 
-    _ = model  # model name reserved; we match by the parakeet repo glob below
     hub = Path.home() / ".cache" / "huggingface" / "hub"
     if not hub.is_dir():
         return False
+
+    # Match the specific model's cache dir when a model is given, so asking
+    # about model B doesn't report True just because model A is cached.
+    # HF cache dirs are named ``models--<org>--<name>``; match on the model's
+    # final path component.
+    model_name = model or DEFAULT_PARAKEET_MODEL
+    leaf = model_name.rsplit("/", 1)[-1]
+    glob_pat = f"models--*{leaf}*" if leaf else "models--*parakeet*"
 
     # Minimum plausible size for a real Parakeet ONNX weight file.  The
     # encoder graph is ~40 MB but its weights live in a sibling
@@ -272,7 +279,7 @@ def ensure_parakeet_cached(model: str | None = None) -> bool:
     # ``*.incomplete`` stubs from interrupted earlier attempts can linger in
     # blobs even after a later attempt completes the real download.  A
     # resolved, non-trivial encoder + decoder is the authoritative signal.
-    for child in hub.glob("models--*parakeet*"):
+    for child in hub.glob(glob_pat):
         snaps = child / "snapshots"
         if not snaps.is_dir():
             continue

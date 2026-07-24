@@ -183,5 +183,11 @@ def _resolve_version() -> str:
         except Exception:
             return version("meetscribe-offline")
     except Exception:
-        from . import __version__
-        return __version__
+        # Source checkout with no installed metadata: fall back to the
+        # package version literal.  __version__ lives in millet/__init__.py,
+        # not millet.cli, so import it from the top-level package.
+        try:
+            from millet import __version__
+            return __version__
+        except Exception:
+            return "unknown"

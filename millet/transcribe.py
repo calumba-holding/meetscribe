@@ -843,6 +843,11 @@ def _extract_mono(audio_file: Path, channel: int = 0) -> Path:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        # Don't orphan the temp file when ffmpeg fails.
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
         raise RuntimeError(f"Failed to extract channel {channel}: {result.stderr}") from None
     return Path(tmp.name)
 
@@ -1002,6 +1007,10 @@ def _mixdown_to_mono(audio_file: Path) -> Path:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
             raise RuntimeError(f"Mono mixdown failed: {result.stderr}")
         return Path(tmp.name)
 
@@ -1399,13 +1408,14 @@ def _detect_language_multiwindow(
     whisperx labels a channel from only the first ~30s, which a misleading
     opener can skew.  This asks the underlying faster-whisper model to sample
     ``config.language_detection_segments`` windows and returns
-    ``(language, confidence)``.  Falls back to ``("en", 0.0)`` if the model
-    doesn't expose ``detect_language`` (older whisperx) or detection fails.
+    ``(language, confidence)``.  Returns ``(None, 0.0)`` if the model doesn't
+    expose ``detect_language`` (older whisperx) or detection fails, so the
+    caller can let the backend auto-detect rather than force a wrong language.
     """
     fw = getattr(model, "model", None)
     detect = getattr(fw, "detect_language", None)
     if detect is None:
-        return ("en", 0.0)
+        return (None, 0.0)
     try:
         lang, prob, _all = detect(
             audio,
@@ -1415,7 +1425,7 @@ def _detect_language_multiwindow(
         return (lang, float(prob))
     except Exception as exc:  # pragma: no cover - backend variance
         print(f"  Warning: multi-window language detection failed ({exc})")
-        return ("en", 0.0)
+        return (None, 0.0)
 
 
 def _apply_default_language_bias(
@@ -1480,6 +1490,16 @@ def _resolve_channel_language(
         return (default or "en"), 0.0, default
 
     lang, conf = _detect_language_multiwindow(asr_model, audio, config)
+    if lang is None:
+        # Detection unavailable/failed.  Prefer an explicit operator default;
+        # otherwise let the backend auto-detect (decode_lang=None) rather than
+        # forcing English on a non-English meeting.
+        default = config.default_language
+        print(
+            f"  Language detection unavailable for {channel_name}; "
+            + (f"using default '{default}'." if default else "letting ASR auto-detect.")
+        )
+        return (default or "en"), 0.0, default
     decode_lang = _apply_default_language_bias(lang, conf, config)
     print(
         f"  Detected {channel_name} language: {lang} ({conf:.2f})"
@@ -2453,6 +2473,10 @@ def _seg_channel_ratio(mic, sys_, start_t, end_t, sr, n):
     """
     import numpy as np
 
+    if start_t is None:
+        # WhisperX alignment routinely emits words without timestamps
+        # (numerals, non-alignable tokens). No window => no usable signal.
+        return None
     start = max(0, min(int(start_t * sr), n))
     end = max(0, min(int((end_t if end_t is not None else start_t) * sr), n))
     if end <= start:

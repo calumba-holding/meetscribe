@@ -1,19 +1,23 @@
 """Meeting summary generation using LLMs.
 
 Supports multiple backends:
-  - claudemax:  Claude Sonnet 4.6 via claude-max-api-proxy on localhost:3456
+  - claudemax:  Claude Sonnet via claude-max-api-proxy on localhost:3457
                 ($0 extra — uses existing Claude Max subscription).
+  - tinfoil:    Hardware-attested TEE inference (requires TINFOIL_API_KEY).
   - openrouter: OpenRouter API (OpenAI-compatible, requires OPENROUTER_API_KEY).
-  - ollama:     Local Ollama server (free, lowest quality, last resort).
+  - ollama:     Local Ollama server (free, fully local).
+  - openai:     Any OpenAI-compatible endpoint (opt-in; never in fallback).
 
-Fallback chain: claudemax -> openrouter -> ollama.
-When the configured primary backend is unavailable, the system automatically
-tries the next backend in the fallback order.
+Fallback chain: claudemax -> tinfoil -> openrouter -> ollama (see
+FALLBACK_ORDER).  When the configured primary backend is unavailable, the
+system automatically tries the next backend in the fallback order.  The
+MILLET_SUMMARY_MODEL override applies to the user's chosen backend only; each
+fallback backend uses its own hardcoded default model.
 
 Configuration precedence (highest to lowest):
   1. Explicit keyword arguments / CLI flags (--summary-backend, --summary-model)
-  2. Environment variables (MEETSCRIBE_SUMMARY_BACKEND, MEETSCRIBE_SUMMARY_MODEL)
-  3. Hardcoded defaults (ollama / gpt-oss:20b)
+  2. Environment variables (MILLET_SUMMARY_BACKEND, MILLET_SUMMARY_MODEL)
+  3. Hardcoded defaults (ollama / qwen3.5:9b)
 """
 
 from __future__ import annotations
@@ -305,12 +309,8 @@ def _resolve_backend() -> str:
     ).lower()
 
 
-def _resolve_model(backend: str) -> str:
-    """Resolve the default model for a backend from env var or hardcoded default."""
-    from .paths import getenv_renamed
-    env_model = getenv_renamed("MILLET_SUMMARY_MODEL", "MEETSCRIBE_SUMMARY_MODEL")
-    if env_model:
-        return env_model
+def _default_model_for_backend(backend: str) -> str:
+    """Hardcoded default model for a backend, ignoring any env override."""
     if backend == "openrouter":
         return DEFAULT_OPENROUTER_MODEL
     if backend == "claudemax":
@@ -320,6 +320,21 @@ def _resolve_model(backend: str) -> str:
     if backend == "tinfoil":
         return DEFAULT_TINFOIL_MODEL
     return DEFAULT_OLLAMA_MODEL
+
+
+def _resolve_model(backend: str) -> str:
+    """Resolve the default model for a backend from env var or hardcoded default.
+
+    The ``MILLET_SUMMARY_MODEL`` env override applies to the user's *chosen*
+    backend only.  For fallback backends (see :func:`_default_model_for_backend`)
+    the env model must be ignored — a model name valid for e.g. Ollama would
+    otherwise be forced onto OpenRouter/claudemax and fail the whole chain.
+    """
+    from .paths import getenv_renamed
+    env_model = getenv_renamed("MILLET_SUMMARY_MODEL", "MEETSCRIBE_SUMMARY_MODEL")
+    if env_model:
+        return env_model
+    return _default_model_for_backend(backend)
 
 
 def _resolve_ollama_singlepass() -> bool:
@@ -338,8 +353,8 @@ class SummaryConfig:
     Supports multiple backends. The ``backend`` and ``model`` fields
     respect environment variables when left at their sentinel values:
 
-        MEETSCRIBE_SUMMARY_BACKEND  -> backend  (default: "ollama")
-        MEETSCRIBE_SUMMARY_MODEL    -> model    (default: per-backend)
+        MILLET_SUMMARY_BACKEND      -> backend  (default: "ollama")
+        MILLET_SUMMARY_MODEL        -> model    (default: per-backend)
         OPENROUTER_API_KEY          -> required for openrouter backend
     """
 
@@ -566,7 +581,7 @@ def _backend_not_available_message(config: SummaryConfig) -> str:
     """Return a user-friendly message when the backend is unavailable."""
     if config.backend == "claudemax":
         return (
-            "Claude Max API Proxy is not running at localhost:3456. "
+            "Claude Max API Proxy is not running at localhost:3457. "
             "Start it with: systemctl --user start claude-max-proxy"
         )
     if config.backend == "openrouter":
@@ -581,7 +596,7 @@ def _backend_not_available_message(config: SummaryConfig) -> str:
         )
     if config.backend == "openai":
         return (
-            "MEETSCRIBE_OPENAI_BASE_URL is not set. "
+            "MILLET_OPENAI_BASE_URL is not set. "
             "Export it with the base URL of your OpenAI-compatible API."
         )
     return (
@@ -990,7 +1005,7 @@ def _summarize_claudemax(
 
     if not is_claudemax_available():
         raise ConnectionError(
-            "Claude Max API Proxy is not running at localhost:3456. "
+            "Claude Max API Proxy is not running at localhost:3457. "
             "Start it with: systemctl --user start claude-max-proxy"
         )
 
@@ -1043,8 +1058,8 @@ def _summarize_openai(
     """Send a summarization request to any OpenAI-compatible API endpoint.
 
     Configured via environment variables:
-        MEETSCRIBE_OPENAI_BASE_URL  — required (e.g. http://localhost:8000/v1)
-        MEETSCRIBE_OPENAI_API_KEY   — optional (defaults to "not-needed")
+        MILLET_OPENAI_BASE_URL  — required (e.g. http://localhost:8000/v1)
+        MILLET_OPENAI_API_KEY   — optional (defaults to "not-needed")
     """
     import time
 
@@ -1151,10 +1166,13 @@ def _dispatch(
     ``transcript_text`` and ``language`` to be passed through.
     """
     if backend != config.backend:
-        # Build a new config for the fallback backend with its own default model
+        # Build a new config for the fallback backend with its own default
+        # model.  Use the hardcoded default (not _resolve_model) so a user's
+        # MILLET_SUMMARY_MODEL set for the primary backend does not leak into
+        # a different fallback backend and fail the entire chain.
         fallback_config = SummaryConfig(
             backend=backend,
-            model=_resolve_model(backend),
+            model=_default_model_for_backend(backend),
             ollama_url=config.ollama_url,
             timeout=config.timeout,
             temperature=config.temperature,
@@ -1253,7 +1271,9 @@ def summarize(
     # "confidential" preset where falling back to a trust-based provider
     # defeats the purpose.  Fail loudly instead.
     if config.preset and config.preset in SUMMARY_PRESETS:
-        avail_config = SummaryConfig(backend=config.backend)
+        avail_config = SummaryConfig(
+            backend=config.backend, ollama_url=config.ollama_url,
+        )
         if not is_backend_available(avail_config):
             msg = _backend_not_available_message(avail_config)
             preset_label = config.preset
@@ -1271,8 +1291,10 @@ def summarize(
 
     last_error = None
     for backend in backends_to_try:
-        # Check availability before attempting
-        avail_config = SummaryConfig(backend=backend)
+        # Check availability before attempting.  Carry the caller's ollama_url
+        # so a custom Ollama server isn't reported unavailable just because the
+        # probe defaulted to localhost.
+        avail_config = SummaryConfig(backend=backend, ollama_url=config.ollama_url)
         if not is_backend_available(avail_config):
             if backend == config.backend:
                 _log(f"{backend} is unavailable: {_backend_not_available_message(avail_config)}")
@@ -1280,9 +1302,9 @@ def summarize(
                 _log(f"Fallback {backend} also unavailable, skipping...")
             continue
 
-        # If this is a fallback, log it
+        # If this is a fallback, log it (with the model actually used)
         if backend != config.backend:
-            _log(f"Falling back to {backend} ({_resolve_model(backend)})...")
+            _log(f"Falling back to {backend} ({_default_model_for_backend(backend)})...")
 
         # Inform the user when the local two-pass flow is about to run, since
         # it takes noticeably longer than a single LLM call.

@@ -137,6 +137,21 @@ def _apply_json_mode(
         click.echo("No labels to apply and no summary regeneration requested.")
         return
 
+    # Snapshot pre-relabel segments (original speaker ids) before apply_labels
+    # rewrites the transcript, so the id-keyed profile update below matches.
+    pre_relabel_segments = None
+    pre_relabel_speakers = None
+    if update_profiles and label_map:
+        try:
+            _pre_files = _find_session_files(session_path)
+            _pre_json = _pre_files.get("json")
+            if _pre_json and _pre_json.exists():
+                _pre_t = _load_transcript(_pre_json)
+                pre_relabel_segments = list(_pre_t.segments)
+                pre_relabel_speakers = _pre_t.speakers
+        except Exception:
+            pass
+
     click.echo(f"Applying {len(label_map)} label(s) (non-interactive)...")
     try:
         result_files = apply_labels(
@@ -167,13 +182,19 @@ def _apply_json_mode(
             wav_path = files.get("wav")
             json_path = files.get("json")
             if wav_path and json_path and wav_path.exists():
-                transcript = _load_transcript(json_path)
+                if pre_relabel_segments is not None:
+                    prof_segments = pre_relabel_segments
+                    prof_speakers = pre_relabel_speakers
+                else:
+                    reloaded = _load_transcript(json_path)
+                    prof_segments = reloaded.segments
+                    prof_speakers = reloaded.speakers
                 channel_map = _detect_speaker_channels(
-                    wav_path, transcript.segments, transcript.speakers,
+                    wav_path, prof_segments, prof_speakers,
                 )
                 update_profiles_from_confirmed_labels(
                     wav_path,
-                    transcript.segments,
+                    prof_segments,
                     label_map,
                     channel_map,
                     profiles_path=team_profiles_path,
@@ -222,13 +243,13 @@ def _apply_json_mode(
         ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
-    help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
+    help="Summary backend (default: ollama, or MILLET_SUMMARY_BACKEND env var)",
 )
 @click.option(
     "--summary-model",
     type=str,
     default=None,
-    help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
+    help="Model for summary (default: per-backend, or MILLET_SUMMARY_MODEL env var)",
 )
 @click.option(
     "--ollama-singlepass",
@@ -595,6 +616,13 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
         click.echo(f"  {old} -> {new}")
     click.echo()
 
+    # Snapshot the pre-relabel segments (original speaker ids) BEFORE
+    # apply_labels rewrites the transcript JSON with the confirmed names.
+    # The profile update below matches segments by original id; reloading
+    # the transcript afterwards would yield relabeled segments and silently
+    # match nothing.
+    pre_relabel_segments = list(transcript.segments) if transcript is not None else None
+
     # Apply labels and regenerate outputs
     regenerate_summary = not no_summary
 
@@ -654,17 +682,28 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
             try:
                 from millet.voiceprint import update_profiles_from_confirmed_labels
 
-                transcript = _load_transcript(files["json"])
+                # Use the pre-relabel segments (original speaker ids) so the
+                # id-keyed profile_labels actually match segments.  Fall back
+                # to loading the (already-relabeled) transcript only when no
+                # snapshot exists — in that case profile_labels keys won't
+                # match, but we avoid crashing.
+                if pre_relabel_segments is not None:
+                    prof_segments = pre_relabel_segments
+                    prof_speakers = transcript.speakers
+                else:
+                    reloaded = _load_transcript(files["json"])
+                    prof_segments = reloaded.segments
+                    prof_speakers = reloaded.speakers
                 # Rebuild channel_map if not already done
                 if not channel_map:
                     channel_map = _detect_speaker_channels(
                         wav_path,
-                        transcript.segments,
-                        transcript.speakers,
+                        prof_segments,
+                        prof_speakers,
                     )
                 update_profiles_from_confirmed_labels(
                     wav_path,
-                    transcript.segments,
+                    prof_segments,
                     profile_labels,
                     channel_map,
                     profiles_path=team_profiles_path,

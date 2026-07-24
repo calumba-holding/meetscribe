@@ -10,6 +10,7 @@ Repo clone:               ~/.local/share/meet/<repo-name>/
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -202,12 +203,12 @@ def load_sync_config(
     """
     p = _resolve_sync_config_path(team, config_path)
     if not p.exists():
-        return DEFAULT_CONFIG
+        return copy.deepcopy(DEFAULT_CONFIG)
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception as exc:
         log.warning("Could not load sync config: %s — using defaults", exc)
-        return DEFAULT_CONFIG
+        return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_sync_config(
@@ -233,14 +234,50 @@ def is_sync_configured(
 
 
 def _repo_name_from_url(repo_url: str) -> str:
-    """Extract a directory name from a Git URL.
+    """Extract a safe directory name from a Git URL.
 
     e.g. 'https://github.com/org/my-repo.git' -> 'my-repo'
+
+    The name is sanitized so a hostile ``repo_url`` (e.g. ending in ``..`` or
+    containing path separators) cannot make the clone dir escape the clone
+    base directory.
     """
     name = repo_url.rstrip("/").rsplit("/", 1)[-1]
     if name.endswith(".git"):
         name = name[:-4]
+    # Strip anything that isn't a safe filename char; collapse traversal.
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+    name = name.strip(".")  # no leading/trailing dots => no "." / ".."
     return name or "sync-repo"
+
+
+# Allowed transports for `git clone`: standard network schemes, scp-style
+# user@host:path, file:// URLs, and absolute local filesystem paths (used for
+# local/NFS bare repos and in tests).  Anything else — notably git's
+# option-capable / arbitrary-command transports like ``ext::sh -c ...`` — is
+# rejected, as is a repo_url that git would parse as an option (leading '-').
+_ALLOWED_REPO_URL_RE = re.compile(
+    r"^(?:https://|ssh://|git://|file://|/|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:)",
+)
+
+
+def _validate_repo_url(repo_url: str) -> None:
+    """Reject repo URLs that could smuggle git options or unsafe transports.
+
+    A ``repo_url`` from a provisioned/hostile ``sync_config.json`` is passed to
+    ``git clone``; without validation a value like ``--upload-pack=<cmd>`` or
+    ``ext::sh -c <cmd>`` yields arbitrary command execution.
+    """
+    if repo_url.startswith("-"):
+        raise RuntimeError(
+            f"Refusing repo_url that looks like a git option: {_redact(repo_url)!r}"
+        )
+    if not _ALLOWED_REPO_URL_RE.match(repo_url):
+        raise RuntimeError(
+            "Unsupported repo_url scheme. Use https://, ssh://, git://, "
+            "file://, an absolute path, or scp-style user@host:path — got: "
+            f"{_redact(repo_url)!r}"
+        )
 
 
 # ─── Schedule matching ────────────────────────────────────────────────────────
@@ -564,6 +601,7 @@ def ensure_repo_cloned(progress_callback=None, team: str | None = None) -> Path:
             f"Set it in {_resolve_sync_config_path(team)} or run: "
             "meet sync --init-config"
         )
+    _validate_repo_url(repo_url)
 
     clone_dir = _clone_dir_for(repo_url, team)
 
@@ -576,7 +614,7 @@ def ensure_repo_cloned(progress_callback=None, team: str | None = None) -> Path:
     if not clone_dir.exists():
         _log(f"Cloning {_redact(repo_url)}...")
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
-        _run_network(["git", "clone", repo_url, str(clone_dir)])
+        _run_network(["git", "clone", "--", repo_url, str(clone_dir)])
         _log("Clone complete.")
         # New clone: register the local-only ignore for collision markers.
         _ensure_local_gitignore(clone_dir)

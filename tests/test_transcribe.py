@@ -1579,3 +1579,48 @@ class TestResolveChannelLanguage:
             None, object(), self._cfg(), None, "audio"
         )
         assert decode == "en"
+
+    def test_detection_unavailable_without_default_auto_detects(self):
+        """When detection returns None and no default is set, decode_lang is
+        None so the ASR auto-detects instead of being forced to English."""
+        cfg = TranscriptionConfig(device="cpu")  # no default_language
+        with patch(
+            "millet.transcribe._detect_language_multiwindow",
+            return_value=(None, 0.0),
+        ):
+            _reported, _conf, decode = _resolve_channel_language(
+                object(), object(), cfg, None, "system"
+            )
+        assert decode is None
+
+    def test_detection_unavailable_with_default_uses_default(self):
+        with patch(
+            "millet.transcribe._detect_language_multiwindow",
+            return_value=(None, 0.0),
+        ):
+            _reported, _conf, decode = _resolve_channel_language(
+                object(), object(), self._cfg(), None, "system"
+            )
+        assert decode == "en"
+
+
+class TestSegChannelRatio:
+    def test_none_start_returns_none_no_crash(self):
+        """A word without a start timestamp must not raise TypeError."""
+        import numpy as np
+
+        from millet.transcribe import _seg_channel_ratio
+
+        mic = np.ones(1000, dtype=np.float32)
+        sys_ = np.ones(1000, dtype=np.float32)
+        assert _seg_channel_ratio(mic, sys_, None, 1.0, 100, 1000) is None
+
+    def test_normal_window_returns_ratio(self):
+        import numpy as np
+
+        from millet.transcribe import _seg_channel_ratio
+
+        mic = np.ones(1000, dtype=np.float32)
+        sys_ = np.ones(1000, dtype=np.float32)
+        r = _seg_channel_ratio(mic, sys_, 0.0, 5.0, 100, 1000)
+        assert r == pytest.approx(0.5)

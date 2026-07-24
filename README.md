@@ -95,7 +95,7 @@ including browser-based meetings and standalone desktop clients.
   and one-click access to results
 - **CLI** -- `millet record`, `millet transcribe`, `millet run`, `millet gui`,
   `millet label`, `millet enroll`, `millet sync`, `millet ingest`,
-  `millet devices`, `millet check`
+  `millet download`, `millet translate`, `millet devices`, `millet check`
 - **Per-session folders** -- each recording gets its own organized directory
 - **Offline-first** -- after initial model download, core features work without
   internet; cloud backends are optional upgrades
@@ -166,9 +166,10 @@ cd millet
 pip install -e .
 ```
 
-This creates the `meet` command in your PATH.  The `[tee]` extra adds
-the `tinfoil` Python SDK (≈ 2 MB).  Set `TINFOIL_API_KEY` to use the
-`--summary-preset confidential` route; see *Summarization presets* below.
+This creates the `millet` command in your PATH (the older `meet` command is
+kept as a deprecated alias).  The `[tee]` extra adds the `tinfoil` Python SDK
+(≈ 2 MB).  Set `TINFOIL_API_KEY` to use the `--summary-preset confidential`
+route; see *Summarization presets* below.
 
 ### 3. HuggingFace token (for speaker diarization)
 
@@ -214,7 +215,7 @@ millet record
 ```
 
 Press Ctrl+C when the meeting ends. A 10-second drain buffer ensures all audio
-is captured. Recordings are saved to `~/millet-recordings/`.
+is captured. Recordings are saved to `~/meet-recordings/`.
 
 Options:
 - `-o /path` -- save recordings elsewhere
@@ -225,16 +226,19 @@ Options:
 ### Transcribe a recording
 
 ```bash
-millet transcribe ~/millet-recordings/meeting-20260312-140000/meeting-20260312-140000.wav
+millet transcribe ~/meet-recordings/meeting-20260312-140000/meeting-20260312-140000.wav
 ```
 
 Options:
 - `-m large-v3-turbo` -- Whisper model (default: `large-v3-turbo`; also: `base`, `medium`, `large-v2`)
 - `-l auto` -- language code or `auto` to auto-detect (default: `auto`; e.g. `en`, `de`, `tr`, `fa`)
-- `--asr-backend auto` -- ASR backend: `auto`, `whisperx`, or `mlx`. On Apple
-  Silicon with `mlx-whisper` installed, `auto` uses MLX Whisper for ASR.
-  MLX only replaces the transcription step; millet still requires
-  WhisperX for audio loading, alignment, and diarization.
+- `--asr-backend auto` -- ASR backend: `auto`, `whisperx`, `mlx`, or
+  `parakeet`. On Apple Silicon with `mlx-whisper` installed, `auto` uses MLX
+  Whisper for ASR. MLX only replaces the transcription step; millet still
+  requires WhisperX for audio loading, alignment, and diarization. `parakeet`
+  uses NVIDIA Parakeet ONNX (English; install with `pip install
+  'millet-pipeline[parakeet]'`); see `--parakeet-model` /
+  `--parakeet-keep-alignment`.
 - `--mlx-model <repo-or-path>` -- MLX Whisper model path/repo (default: maps
   `large-v3-turbo` to `mlx-community/whisper-large-v3-turbo`)
 - `--device cuda` -- `cuda` or `cpu`. Default: auto-detected — `cpu` on
@@ -246,29 +250,43 @@ Options:
 - `--min-speakers 2` / `--max-speakers 6` -- hint for number of speakers
 - `--no-diarize` -- skip speaker diarization
 - `--no-summarize` -- skip AI summary generation
-- `--summary-backend openrouter` -- summary backend (`ollama`, `openrouter`, `claudemax`, `openai`)
+- `--summary-backend openrouter` -- summary backend (`ollama`, `openrouter`, `claudemax`, `openai`, `tinfoil`)
 - `--summary-model <model>` -- model for summary (default: per-backend)
 - `--skip-alignment` -- skip word-level alignment (useful if alignment model is unavailable)
-- `--mixdown mono|dual` -- stereo mixdown mode (default: `mono`). Use `dual` for
-  headphone setups where mic and system audio don't bleed into each other (see below)
+- `--mixdown mono|dual|dual-diarize` -- stereo mixdown mode (default:
+  `dual-diarize`). See *Dual-channel modes* below.
+- `--default-language <code>` -- team/operator default language that biases
+  low-confidence auto-detection (e.g. `en`); pairs with
+  `--language-detection-segments N` (default `6`).
+- Dual-diarize tuning: `--channel-correct/--no-channel-correct` (+
+  `--channel-correct-margin`, default `0.30`) for mic-bleed/echo correction,
+  `--consolidate-remote-clusters/--no-...` to merge phantom remote speakers,
+  and `--single-source-fallback/--no-...` for in-room (non-headphone)
+  recordings detected as single-source.
 
-#### Dual-channel mode for headphone users
+#### Dual-channel modes
 
-If you use headphones, your mic captures only your voice while the system
-channel captures only the remote participants. In this setup the default mono
-mixdown creates a ~20× energy imbalance that causes WhisperX to suppress the
-quieter voice.
+Stereo recordings carry your mic on the left channel and system audio on the
+right. `transcribe` defaults to **`--mixdown dual-diarize`**, which
+transcribes each channel independently for best accuracy and then diarizes
+the remote (system) channel to separate multiple remote participants. It
+labels the local speaker as YOU (mic) and diarized remotes as REMOTE_1,
+REMOTE_2, … The three modes:
 
-Use `--mixdown dual` to transcribe each channel independently:
+- `dual-diarize` (default) -- per-channel transcription + diarization of
+  remotes. Best accuracy for headphone setups where mic and system audio
+  don't bleed into each other.
+- `dual` -- per-channel transcription with no remote diarization (channel
+  identity = speaker identity: YOU vs. REMOTE).
+- `mono` (legacy) -- mix both channels to mono, then diarize. Use it when
+  your speakers play into the room and both voices appear on both channels.
 
 ```bash
-millet transcribe --mixdown dual ~/millet-recordings/meeting-20260312-140000/
+millet transcribe --mixdown dual-diarize ~/meet-recordings/meeting-20260312-140000/
 ```
 
-This skips diarization entirely (channel identity = speaker identity) and
-labels segments as YOU (mic) or REMOTE (system). Default `--mixdown mono`
-behavior is unchanged -- use it when your speakers play into the room and
-both voices appear on both channels.
+Note: `millet run` still defaults to `--mixdown mono` and accepts `mono` or
+`dual`; pass `--mixdown dual` there for headphone recordings.
 
 ### Record + transcribe in one shot
 
@@ -277,8 +295,10 @@ millet run
 ```
 
 Records until Ctrl+C, then automatically transcribes, generates a summary,
-and produces a PDF. Takes all options from both `record` and `transcribe`
-(including `--mixdown dual`).
+and produces a PDF. Takes options from both `record` and `transcribe`. Note
+`run`'s `--mixdown` defaults to `mono` and accepts only `mono` or `dual`
+(unlike `transcribe`, which defaults to `dual-diarize`); use `millet
+transcribe` on the saved recording if you need `dual-diarize`.
 
 ### Launch the GUI widget
 
@@ -306,7 +326,7 @@ a **sync confirmation prompt** appears with Push / Skip buttons.
 ### Label speakers after the fact
 
 ```bash
-millet label ~/millet-recordings/meeting-20260313-214133
+millet label ~/meet-recordings/meeting-20260313-214133
 ```
 
 For each speaker in the recording, `millet label`:
@@ -320,7 +340,7 @@ Confident matches are applied without prompting; only unrecognized speakers get
 the interactive prompt:
 
 ```bash
-millet label --auto ~/millet-recordings/meeting-20260313-214133
+millet label --auto ~/meet-recordings/meeting-20260313-214133
 ```
 
 Options:
@@ -328,13 +348,23 @@ Options:
 - `--no-audio` -- skip audio playback, just show text samples
 - `--no-summary` -- use find-and-replace instead of re-running Ollama
 - `--summary-backend` / `--summary-model` -- override summary backend and model for regeneration
+- `--apply-json FILE` (or `-` for stdin) -- non-interactive labeling: apply a
+  `{"OLD_ID": "Name", ...}` map (or `{"labels": {...}}` envelope) and exit
+- `--update-profiles` -- with `--apply-json`, update voiceprint profiles from
+  the confirmed labels
+- `--summary-language <code>` -- also emit a translated `.summary.<lang>.md`
+- `--team <name>` -- use a team-scoped profile database (see below)
+
+When run without a TTY (e.g. from a worker), `--auto` applies confident
+matches and skips the interactive prompt automatically, writing an
+`.autoid.json` sidecar with per-speaker match confidence.
 
 ## Output
 
 Each recording gets its own session directory:
 
 ```
-~/millet-recordings/meeting-20260312-140000/
+~/meet-recordings/meeting-20260312-140000/
     meeting-20260312-140000.wav                 # Stereo audio (16kHz)
     meeting-20260312-140000.session.json        # Recording metadata
     meeting-20260312-140000.ffmpeg.log          # ffmpeg capture log
@@ -406,19 +436,19 @@ your meetings.
 
 ### Backfilling existing sessions
 
-Sessions recorded before millet 0.7.0 don't carry frontmatter.
-Re-extract it for one or more sessions with:
+Sessions recorded before meetscribe 0.7.0 / millet-pipeline 0.9.0 don't
+carry frontmatter. Re-extract it for one or more sessions with:
 
 ```bash
 # Re-run the LLM to produce frontmatter; idempotent (skips sessions
 # whose .summary.meta.json already records data_extracted=true).
-millet ingest ~/millet-recordings/meeting-2026*
+millet ingest ~/meet-recordings/meeting-2026*
 
 # Force re-extraction even when frontmatter is already present:
-millet ingest --force ~/millet-recordings/meeting-20260312-140000
+millet ingest --force ~/meet-recordings/meeting-20260312-140000
 
 # Preview without invoking the LLM:
-millet ingest --dry-run ~/millet-recordings/meeting-2026*
+millet ingest --dry-run ~/meet-recordings/meeting-2026*
 ```
 
 `millet ingest` accepts the same `--summary-backend` /
@@ -466,7 +496,7 @@ millet supports five backends with automatic fallback:
 | `openrouter` | Set `OPENROUTER_API_KEY` | Pay-per-use | Excellent | Cloud (model-provider-visible) |
 | `claudemax` | Run claude-max-api-proxy on localhost:3457 | Claude Max subscription | Excellent | Cloud (Anthropic-visible) |
 | `tinfoil` | `pip install 'millet-pipeline[tee]'`, set `TINFOIL_API_KEY` (or drop a key file at `~/models/tinfoil/tinfoil.txt`) | ~$0.009/meeting | Excellent (GLM-5.2) | **Hardware-attested TEE — prompts not visible to provider/operator** |
-| `openai` | Set `MEETSCRIBE_OPENAI_BASE_URL` | Varies | Varies | Depends on endpoint |
+| `openai` | Set `MILLET_OPENAI_BASE_URL` | Varies | Varies | Depends on endpoint |
 
 The `openai` backend works with any OpenAI-compatible API — Lemonade, LiteLLM,
 vLLM, text-generation-webui, LocalAI, or any self-hosted endpoint.
@@ -482,15 +512,19 @@ integrity is checked against an attestation report on every request.
 millet run --summary-backend openrouter --summary-model anthropic/claude-sonnet-4.6
 
 # Use any OpenAI-compatible endpoint
-export MEETSCRIBE_SUMMARY_BACKEND=openai
-export MEETSCRIBE_OPENAI_BASE_URL=http://localhost:8000/v1
-export MEETSCRIBE_SUMMARY_MODEL=your-model-name
-# Optional: export MEETSCRIBE_OPENAI_API_KEY=your-key
+export MILLET_SUMMARY_BACKEND=openai
+export MILLET_OPENAI_BASE_URL=http://localhost:8000/v1
+export MILLET_SUMMARY_MODEL=your-model-name
+# Optional: export MILLET_OPENAI_API_KEY=your-key
 
 # Or set via environment variables
-export MEETSCRIBE_SUMMARY_BACKEND=openrouter
-export MEETSCRIBE_SUMMARY_MODEL=anthropic/claude-sonnet-4.6
+export MILLET_SUMMARY_BACKEND=openrouter
+export MILLET_SUMMARY_MODEL=anthropic/claude-sonnet-4.6
 ```
+
+> Environment variables use the `MILLET_` prefix. The older `MEETSCRIBE_`
+> (and `MEET_`) spellings still work for one more release but emit a
+> `DeprecationWarning`.
 
 If the configured backend is unavailable, millet automatically tries the
 next one in the fallback chain: **claudemax → tinfoil → openrouter → ollama**.
@@ -508,7 +542,7 @@ the entire point of choosing TEE-attested inference).
 
 A preset is a friendly name that resolves to a concrete `(backend, model)`
 pair.  Set it via `--summary-preset` on `transcribe`, `run`, `label`,
-`gui`, or `ingest`, or via the `MEETSCRIBE_SUMMARY_PRESET` env var.
+`gui`, or `ingest`, or via the `MILLET_SUMMARY_PRESET` env var.
 
 | Preset | Backend | Model | Use case |
 |---|---|---|---|
@@ -518,10 +552,10 @@ pair.  Set it via `--summary-preset` on `transcribe`, `run`, `label`,
 
 ```bash
 # Quick check of which preset is in effect
-millet transcribe ~/millet-recordings/today/today.wav --summary-preset confidential
+millet transcribe ~/meet-recordings/today/today.wav --summary-preset confidential
 
 # Or set per-session via env
-export MEETSCRIBE_SUMMARY_PRESET=high-quality
+export MILLET_SUMMARY_PRESET=high-quality
 millet run
 ```
 
@@ -552,7 +586,7 @@ To opt out and use the previous single-pass behavior:
 ```bash
 millet run --ollama-singlepass
 # Or via environment:
-export MEETSCRIBE_OLLAMA_SINGLEPASS=1
+export MILLET_OLLAMA_SINGLEPASS=1
 ```
 
 The `.summary.meta.json` sidecar records per-pass timings
@@ -564,9 +598,11 @@ modes of local 20B-class models.
 
 ### Customizing the prompt
 
-The summarization prompt lives in `meet/prompts/summarize_system.md`. Edit it
-to change the summary format, add domain-specific instructions, or tune for
-your preferred model. No Python changes needed.
+The summarization prompts live in `millet/prompts/` (e.g.
+`summarize_system.md`, plus the `summarize_extract_*` / `summarize_format_*`
+pairs used by the two-pass Ollama flow). Edit them to change the summary
+format, add domain-specific instructions, or tune for your preferred model.
+No Python changes needed.
 
 ## Voiceprint speaker recognition
 
@@ -576,14 +612,19 @@ stored and matched against future recordings.
 
 ```bash
 # Build profiles from already-labeled sessions
-millet enroll ~/millet-recordings/meeting-20260330-*
+millet enroll ~/meet-recordings/meeting-20260330-*
 
 # Auto-label speakers in future meetings using voice profiles
-millet label --auto ~/millet-recordings/meeting-20260401-093000
+millet label --auto ~/meet-recordings/meeting-20260401-093000
 ```
 
 Profiles are stored in `~/.config/meet/speaker_profiles.json` and improve
 with each labeled session (running average of embeddings).
+
+Use `millet enroll --list` to list enrolled speakers. Team-scoped profiles
+are supported via `--team <name>` on `enroll` and `label`, stored under
+`~/.config/meet/<team>/speaker_profiles.json`, so each team keeps its own
+voiceprint database.
 
 ## Meeting sync
 
@@ -595,7 +636,7 @@ millet sync --init-config
 # Edit ~/.config/meet/sync_config.json with your repo URL and schedule
 
 # Push a session manually
-millet sync ~/millet-recordings/meeting-20260331-110038_STANDUP
+millet sync ~/meet-recordings/meeting-20260331-110038_STANDUP
 
 # View configured schedule
 millet sync --list-schedule
@@ -608,6 +649,10 @@ uses `--force` to sync unmatched sessions.
 You can also configure a `team_members` list and `min_team_members` threshold
 in `sync_config.json` to require that a minimum number of recognized speakers
 are present before offering to sync.
+
+`millet sync` supports `--team <name>` (per-team config + clone) and
+`--meeting-type <slug>` for routing. Push failures exit non-zero so scheduled
+sync jobs can detect and retry them.
 
 ## Multilingual support
 
@@ -647,6 +692,31 @@ millet run --language auto     # Auto-detect (default)
 | Turkish  | `tr` | wav2vec2 (HuggingFace) | DejaVu Sans | ~1.2 GB alignment model download |
 | Farsi    | `fa` | wav2vec2 (HuggingFace) | Noto Naskh Arabic | ~1.2 GB alignment model download, RTL |
 
+### Downloading alignment models
+
+Alignment models download automatically on first use, but you can pre-fetch
+them (e.g. before an offline session) with `millet download`:
+
+```bash
+millet download            # show cache status for all supported languages
+millet download de tr fa   # download German, Turkish, Farsi alignment models
+millet download --all      # download every supported alignment model
+millet download parakeet   # download the Parakeet ASR model (English)
+```
+
+It exits non-zero if any requested download fails, so it's safe to script.
+
+### Translating a transcript
+
+`millet translate` renders an existing session transcript into another
+language via Ollama, preserving timestamps and speaker labels. The result is
+saved as `<basename>.translation.<lang>.txt` in the session directory.
+
+```bash
+millet translate ~/meet-recordings/meeting-20260313-231509           # to English
+millet translate ~/meet-recordings/meeting-20260313-231509 --to de   # to German
+```
+
 ### Farsi RTL requirements
 
 Farsi uses right-to-left text. For proper PDF rendering, install the optional
@@ -678,6 +748,32 @@ This creates an isolated audio sink. Route your meeting app's audio to it:
 4. Change its output to "Meet-Capture"
 
 You'll still hear the meeting through your normal speakers via automatic loopback.
+
+## Configuration & environment variables
+
+Environment variables use the `MILLET_` prefix (legacy `MEETSCRIBE_` / `MEET_`
+spellings are honored for one more release with a `DeprecationWarning`):
+
+| Variable | Purpose |
+|----------|---------|
+| `MILLET_SUMMARY_BACKEND` | Default summary backend (`ollama`, `openrouter`, `claudemax`, `openai`, `tinfoil`) |
+| `MILLET_SUMMARY_MODEL` | Default summary model for the chosen backend |
+| `MILLET_SUMMARY_PRESET` | Default preset (`high-quality`, `confidential`, `alternative`) |
+| `MILLET_OLLAMA_SINGLEPASS` | Set to `1` to disable two-pass Ollama summarization |
+| `MILLET_OPENAI_BASE_URL` / `MILLET_OPENAI_API_KEY` | Endpoint + key for the `openai`-compatible backend |
+| `OPENROUTER_API_KEY` | Required for the `openrouter` backend |
+| `TINFOIL_API_KEY` | Required for the `tinfoil` backend (or a key file at `~/models/tinfoil/tinfoil.txt`) |
+| `HF_TOKEN` | HuggingFace token for pyannote diarization |
+| `MILLET_CONFIG_DIR` | Override the config dir (default `~/.config/meet`) |
+| `MILLET_PROFILES_PATH` | Override the voiceprint profile DB path |
+| `MILLET_RECORDINGS_DIR` | Override the recordings directory (default `~/meet-recordings`) |
+
+### Offline mode
+
+Set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` to run without any network
+access. millet honors these and, on a cache miss, prints actionable guidance
+naming the exact model to pre-fetch (via `millet download`) rather than
+failing with an opaque network error.
 
 ## VRAM usage
 

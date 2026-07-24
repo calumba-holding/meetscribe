@@ -85,30 +85,37 @@ def translate(session_dir, target_lang, summary_model):
 
     t0 = _time.time()
 
+    system_content = (
+        f"You are a professional translator. Translate the following "
+        f"meeting transcript to {target_name}. "
+        f"Preserve the exact formatting: keep the timestamp markers "
+        f"like [HH:MM:SS --> HH:MM:SS] and speaker labels (YOU, REMOTE, etc.) "
+        f"unchanged. Only translate the spoken text. "
+        f"Be accurate and natural — do not add or remove information."
+    )
+    user_content = f"Translate this transcript to {target_name}:\n\n{transcript_text}"
+
+    # Size the context window to fit the whole transcript PLUS room for the
+    # translation output (roughly as long as the input).  A fixed num_ctx=8192
+    # silently truncated the prompt for typical 45-105 min meetings.
+    from millet.summarize import _dynamic_num_ctx, _estimate_tokens
+
+    output_reserve = _estimate_tokens(transcript_text) + 1024
+    num_ctx = _dynamic_num_ctx(
+        system_content, user_content, output_reserve=output_reserve,
+    )
+
     payload = {
         "model": model_name,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    f"You are a professional translator. Translate the following "
-                    f"meeting transcript to {target_name}. "
-                    f"Preserve the exact formatting: keep the timestamp markers "
-                    f"like [HH:MM:SS --> HH:MM:SS] and speaker labels (YOU, REMOTE, etc.) "
-                    f"unchanged. Only translate the spoken text. "
-                    f"Be accurate and natural — do not add or remove information."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Translate this transcript to {target_name}:\n\n{transcript_text}",
-            },
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
         ],
         "stream": False,
         "think": False,
         "options": {
             "temperature": 0.2,
-            "num_ctx": 8192,
+            "num_ctx": num_ctx,
         },
     }
 

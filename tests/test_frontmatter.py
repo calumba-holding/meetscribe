@@ -87,6 +87,22 @@ class TestSplitBodyAndData:
         assert data is None
         assert err == "empty completion"
 
+    def test_trailing_object_recovered_despite_earlier_brace_line(self):
+        # Regression: a greedy match anchored at the FIRST line-leading '{'
+        # would span the body's example object + the real trailing block,
+        # fail json.loads, and discard valid trailing data.
+        raw = (
+            "## Overview\n"
+            '{"example": "not the data block"}\n'
+            "Some more body text.\n\n"
+            '{"action_items": [], "decisions": [], "topics": ["real"]}'
+        )
+        body, data, err = split_body_and_data(raw)
+        assert err is None
+        assert data is not None
+        assert data["topics"] == ["real"]
+        assert "Some more body text." in body
+
 
 # ─── build_frontmatter ─────────────────────────────────────────────────────
 

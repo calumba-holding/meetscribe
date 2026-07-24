@@ -246,8 +246,20 @@ def _l2_norm(v: np.ndarray) -> np.ndarray:
 
 # ─── Embedding extraction ─────────────────────────────────────────────────────
 
+# Cache the decoded channels for the most recently accessed file only.  The
+# identify/enroll/update loops call _extract_channel_audio once per speaker but
+# there are only two distinct channels; without this each of N speakers
+# triggered a full-file ffmpeg decode (hundreds of MB for an hour of audio).
+# Scoped to one file so it never accumulates across sessions.
+_CHANNEL_CACHE_KEY: tuple[str, float] | None = None
+_CHANNEL_CACHE: dict[str, tuple[np.ndarray, int] | None] = {}
+
+
 def _extract_channel_audio(audio_path: Path, channel: str) -> tuple[np.ndarray, int] | None:
     """Extract a single audio channel as float32 array.
+
+    Decodes at most once per (file, channel); repeated calls for the same file
+    and channel return the cached array.
 
     Args:
         audio_path: Path to stereo audio file.
@@ -256,6 +268,30 @@ def _extract_channel_audio(audio_path: Path, channel: str) -> tuple[np.ndarray, 
     Returns:
         (samples_float32, sample_rate) or None on failure.
     """
+    global _CHANNEL_CACHE_KEY, _CHANNEL_CACHE
+
+    try:
+        mtime = Path(audio_path).stat().st_mtime
+        key = (str(audio_path), mtime)
+    except OSError:
+        key = None
+
+    if key is not None:
+        if _CHANNEL_CACHE_KEY != key:
+            # New file (or changed on disk): drop the previous file's channels.
+            _CHANNEL_CACHE_KEY = key
+            _CHANNEL_CACHE = {}
+        elif channel in _CHANNEL_CACHE:
+            return _CHANNEL_CACHE[channel]
+
+    result = _decode_channel_audio(audio_path, channel)
+    if key is not None:
+        _CHANNEL_CACHE[channel] = result
+    return result
+
+
+def _decode_channel_audio(audio_path: Path, channel: str) -> tuple[np.ndarray, int] | None:
+    """Decode a single audio channel via ffmpeg (uncached)."""
     import subprocess
 
     ch_idx = 0 if channel == "mic" else 1

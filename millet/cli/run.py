@@ -76,19 +76,19 @@ from ._helpers import (
         ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
-    help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
+    help="Summary backend (default: ollama, or MILLET_SUMMARY_BACKEND env var)",
 )
 @click.option(
     "--summary-model",
     type=str,
     default=None,
-    help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
+    help="Model for summary (default: per-backend, or MILLET_SUMMARY_MODEL env var)",
 )
 @click.option(
     "--ollama-singlepass",
     is_flag=True,
     default=False,
-    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MEETSCRIBE_OLLAMA_SINGLEPASS=1.",
+    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MILLET_OLLAMA_SINGLEPASS=1.",
 )
 @click.option(
     "--skip-alignment",
@@ -225,17 +225,24 @@ def run(
 
         # ── Summary + PDF ──
         summary_result = None
+        preset_summary_error: Exception | None = None
         if summarize:
-            summary_result = _generate_summary(
-                transcript,
-                output.parent,
-                output.stem,
-                summary_model,
-                files,
-                summary_backend=summary_backend,
-                summary_preset=summary_preset,
-                ollama_singlepass=ollama_singlepass,
-            )
+            try:
+                summary_result = _generate_summary(
+                    transcript,
+                    output.parent,
+                    output.stem,
+                    summary_model,
+                    files,
+                    summary_backend=summary_backend,
+                    summary_preset=summary_preset,
+                    ollama_singlepass=ollama_singlepass,
+                )
+            except Exception as exc:
+                # Only raised when summary_preset was set (preset guard).
+                # Generate the PDF first so the recording's transcript
+                # artifacts still exist, then fail non-zero below.
+                preset_summary_error = exc
 
         _generate_pdf(transcript, output.parent, output.stem, summary_result, files)
 
@@ -255,4 +262,19 @@ def run(
         click.echo("--- Transcript ---")
         click.echo()
         click.echo(transcript.to_text())
+
+        if preset_summary_error is not None:
+            # Preset summary failure: surface as non-zero exit so callers
+            # (vezir worker, CI) can detect the partial failure.  The
+            # recording, transcript, and PDF are already on disk.
+            click.echo(err=True)
+            click.echo(
+                click.style(
+                    f"Error: summary failed for preset "
+                    f"'{summary_preset}': {preset_summary_error}",
+                    fg="red",
+                ),
+                err=True,
+            )
+            sys.exit(1)
         sys.exit(0)

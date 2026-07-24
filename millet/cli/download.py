@@ -80,6 +80,7 @@ def download(languages, download_all):
         raise SystemExit(1)
 
     # Download each model
+    failed: list[str] = []
     for lang in languages:
         details = info[lang]
         if details["cached"]:
@@ -93,3 +94,12 @@ def download(languages, download_all):
             click.echo(
                 f"  Error downloading {details['name']} ({lang}): {exc}", err=True
             )
+            failed.append(lang)
+
+    if failed:
+        # Non-zero exit so scripted/CI callers detect the failure instead of
+        # assuming every requested model was fetched.
+        click.echo(
+            f"Error: failed to download: {', '.join(failed)}", err=True
+        )
+        raise SystemExit(1)

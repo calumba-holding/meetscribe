@@ -139,13 +139,13 @@ def _ingest_one_session(
         ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
-    help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
+    help="Summary backend (default: ollama, or MILLET_SUMMARY_BACKEND env var)",
 )
 @click.option(
     "--summary-model",
     type=str,
     default=None,
-    help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
+    help="Model for summary (default: per-backend, or MILLET_SUMMARY_MODEL env var)",
 )
 @click.option(
     "--ollama-singlepass",

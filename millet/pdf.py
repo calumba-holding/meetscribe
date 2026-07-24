@@ -348,22 +348,28 @@ def _md_to_markup(text: str, rtl_wrap=None) -> str:
     if rtl_wrap is None:
         rtl_wrap = lambda t: t  # noqa: E731
 
+    # RTL reshaping must run on the RAW text BEFORE XML-escaping: get_display
+    # bidi-reorders characters, which would scramble multi-char entities like
+    # ``&amp;`` if escaping happened first.  So escape the reshaped output.
+    def _prep(raw: str) -> str:
+        return _escape_xml(rtl_wrap(raw))
+
     # Split on bold markers first (**...**), then italic (*...*)
     parts = re.split(r"(\*\*.*?\*\*)", text)
     built = ""
     for part in parts:
         if part.startswith("**") and part.endswith("**"):
             inner = part[2:-2]
-            built += f"<b>{rtl_wrap(_escape_xml(inner))}</b>"
+            built += f"<b>{_prep(inner)}</b>"
         else:
             # Handle italic (*...*) within non-bold segments
             sub_parts = re.split(r"(\*[^*]+?\*)", part)
             for sp in sub_parts:
                 if sp.startswith("*") and sp.endswith("*") and len(sp) > 2:
                     inner = sp[1:-1]
-                    built += f"<i>{rtl_wrap(_escape_xml(inner))}</i>"
+                    built += f"<i>{_prep(inner)}</i>"
                 else:
-                    built += rtl_wrap(_escape_xml(sp))
+                    built += _prep(sp)
     return built
 
 
@@ -388,7 +394,7 @@ def _summary_to_flowables(
     rtl = _is_rtl(language)
 
     def _rtl_wrap(text: str) -> str:
-        """Apply RTL reshaping if needed (after XML-escaping)."""
+        """Apply RTL reshaping to RAW text if needed (callers escape after)."""
         return _reshape_rtl(text) if rtl else text
 
     for line in lines:
@@ -405,7 +411,7 @@ def _summary_to_flowables(
                 heading_text = heading_text[2:-2]
             flowables.append(
                 Paragraph(
-                    _rtl_wrap(_escape_xml(heading_text)),
+                    _escape_xml(_rtl_wrap(heading_text)),
                     styles["summary_heading"],
                 )
             )
@@ -619,11 +625,12 @@ def generate_pdf(
         )
         story.append(Paragraph(header, styles["speaker"]))
 
-        # Transcript text
-        text = _escape_xml(turn["text"])
+        # Transcript text — reshape RAW text before escaping so bidi
+        # reordering can't scramble multi-char XML entities (&amp; etc.).
+        raw_text = turn["text"]
         if rtl:
-            text = _reshape_rtl(text)
-        story.append(Paragraph(text, styles["transcript_text"]))
+            raw_text = _reshape_rtl(raw_text)
+        story.append(Paragraph(_escape_xml(raw_text), styles["transcript_text"]))
 
     # ── Build PDF ──
     # Auto-detect confidential mode from summary backend

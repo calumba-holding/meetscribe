@@ -60,10 +60,9 @@ _FENCED_JSON_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
-# Fallback: a top-level JSON object as the trailing chunk of the output,
-# preceded by a clear separator line.  We try this only if no fenced block
-# is found.  We require a balanced-brace heuristic.
-_TRAILING_JSON_RE = re.compile(r"(?:^|\n)(\{[^`]*\})\s*$", re.DOTALL)
+# Fallback: a top-level JSON object as the trailing chunk of the output.
+# We try this only if no fenced block is found.  The candidate scan lives in
+# split_body_and_data (it tries each line-leading '{' from last to first).
 
 
 def split_body_and_data(raw: str) -> tuple[str, dict | None, str | None]:
@@ -100,21 +99,32 @@ def split_body_and_data(raw: str) -> tuple[str, dict | None, str | None]:
         except json.JSONDecodeError as e:
             return body, None, f"fenced JSON parse error: {e}"
 
-    m = _TRAILING_JSON_RE.search(text)
-    if m:
-        candidate = m.group(1)
+    if not text.endswith("}"):
+        return text, None, "no JSON block found"
+
+    # Try each line-leading '{' as a candidate start for the trailing object,
+    # from the LAST one to the first.  A single greedy regex would anchor at
+    # the earliest '{' — swallowing body text before the real JSON and failing
+    # to parse, which discarded genuinely valid trailing data.
+    starts = [0] if text.startswith("{") else []
+    starts += [m.start() + 1 for m in re.finditer(r"\n(\{)", text)]
+    for start in reversed(starts):
+        candidate = text[start:].strip()
         # Be conservative: only treat it as the data block when it parses AND
         # contains at least one of the expected keys.  Otherwise leave it in
         # the body where it might be a real example.
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
-            return text, None, "no JSON block found"
+            continue
         if isinstance(parsed, dict) and any(
             k in parsed for k in ("action_items", "decisions", "topics", "participants")
         ):
-            body = text[: m.start()].rstrip()
+            body = text[:start].rstrip()
             return body, parsed, None
+        # Parsed but not a data block: it's an example; stop searching earlier
+        # (broader) candidates that would only re-include this same object.
+        break
 
     return text, None, "no JSON block found"
 

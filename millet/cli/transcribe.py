@@ -148,19 +148,19 @@ def _echo_offline_model_help(model: str, audio_file: str) -> None:
         ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
-    help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
+    help="Summary backend (default: ollama, or MILLET_SUMMARY_BACKEND env var)",
 )
 @click.option(
     "--summary-model",
     type=str,
     default=None,
-    help="Model for summary (default: per-backend, or MEETSCRIBE_SUMMARY_MODEL env var)",
+    help="Model for summary (default: per-backend, or MILLET_SUMMARY_MODEL env var)",
 )
 @click.option(
     "--ollama-singlepass",
     is_flag=True,
     default=False,
-    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MEETSCRIBE_OLLAMA_SINGLEPASS=1.",
+    help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MILLET_OLLAMA_SINGLEPASS=1.",
 )
 @click.option(
     "--skip-alignment",

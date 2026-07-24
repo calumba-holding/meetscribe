@@ -266,44 +266,45 @@ def extract_speaker_clip(
     """
     wav_path = Path(wav_path)
 
-    stereo = read_stereo_channels(wav_path)
-    if stereo is not None:
-        # Stereo: pick the speaker's dominant channel
-        ch_data = stereo.mic if speaker_info.channel == "mic" else stereo.system
-        file_sr = stereo.sample_rate
-        sampwidth = stereo.sampwidth
-        # Convert back to integer dtype for writing
-        if sampwidth == 2:
-            channel_data = ch_data.astype(np.int16)
-        else:
-            channel_data = ch_data.astype(np.int32)
-    else:
-        # Mono fallback: decode via ffmpeg (works for WAV, OGG, etc.)
-        cmd = [
-            "ffmpeg", "-v", "quiet",
-            "-i", str(wav_path),
-            "-f", "s16le", "-acodec", "pcm_s16le",
-            "-ac", "1", "-",
-        ]
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0 or not result.stdout:
-            raise RuntimeError(f"Cannot decode audio: {wav_path}")
-        sampwidth = 2
-        # Get sample rate via ffprobe
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "stream=sample_rate",
-             "-of", "csv=p=0", str(wav_path)],
-            capture_output=True, text=True,
-        )
-        file_sr = int(probe.stdout.strip()) if probe.returncode == 0 else 16000
-        channel_data = np.frombuffer(result.stdout, dtype=np.int16)
-
-    # Extract the time range
-    start_frame = max(0, int(speaker_info.sample_start * file_sr))
+    # Seek-decode ONLY the clip window instead of decoding the whole file.
+    # For an hour-long recording the old full-file decode (per speaker, and on
+    # the GTK main thread) blocked the UI for seconds and allocated hundreds of
+    # MB; -ss/-t makes this near-instant.
+    sampwidth = 2  # we always request pcm_s16le below
+    file_sr = 16000
+    start = max(0.0, float(speaker_info.sample_start))
     duration = min(speaker_info.sample_end - speaker_info.sample_start, max_duration)
-    end_frame = min(int((speaker_info.sample_start + duration) * file_sr), len(channel_data))
+    if duration <= 0:
+        raise RuntimeError(f"Empty audio clip for speaker {speaker_info.id}")
 
-    clip = channel_data[start_frame:end_frame]
+    # Probe channel count so we know whether we can select a channel.
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "stream=channels",
+         "-of", "csv=p=0", str(wav_path)],
+        capture_output=True, text=True,
+    )
+    try:
+        n_channels = int(probe.stdout.strip().split(",")[0])
+    except (ValueError, IndexError):
+        n_channels = 1
+
+    cmd = [
+        "ffmpeg", "-v", "quiet",
+        "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+        "-i", str(wav_path),
+    ]
+    if n_channels >= 2:
+        # mic = channel 0 (left), system = channel 1 (right)
+        ch = 0 if speaker_info.channel == "mic" else 1
+        cmd += ["-filter_complex", f"[0:a]pan=mono|c0=c{ch}[out]", "-map", "[out]"]
+    else:
+        cmd += ["-ac", "1"]
+    cmd += ["-ar", str(file_sr), "-f", "s16le", "-acodec", "pcm_s16le", "-"]
+
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0 or not result.stdout:
+        raise RuntimeError(f"Cannot decode audio clip: {wav_path}")
+    clip = np.frombuffer(result.stdout, dtype=np.int16).copy()
 
     if len(clip) == 0:
         raise RuntimeError(f"Empty audio clip for speaker {speaker_info.id}")
@@ -320,8 +321,9 @@ def extract_speaker_clip(
                 clip.astype(np.float64) * scale, -max_val, max_val,
             ).astype(clip.dtype)
 
-    # Write to temp file
+    # Write to temp file (close the fd immediately; wave reopens by name).
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
     with wave.open(tmp.name, "wb") as out:
         out.setnchannels(1)
         out.setsampwidth(sampwidth)
@@ -783,7 +785,15 @@ def apply_labels(
         _log("Updating session metadata...")
         try:
             meta = json.loads(files["session"].read_text(encoding="utf-8"))
-            meta["speaker_labels"] = label_map
+            # Merge, don't overwrite: a later labeling pass (e.g. naming a
+            # remaining REMOTE_2) must not discard names confirmed earlier,
+            # which enroll_session depends on being complete.
+            existing = meta.get("speaker_labels")
+            if isinstance(existing, dict):
+                existing.update(label_map)
+                meta["speaker_labels"] = existing
+            else:
+                meta["speaker_labels"] = label_map
             files["session"].write_text(
                 json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8",
             )

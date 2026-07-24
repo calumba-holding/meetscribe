@@ -228,6 +228,10 @@ class MeetRecorderWindow(Gtk.Window):
         # Background post-processing job queue
         self._job_queue: queue.Queue[Path] = queue.Queue()
         self._job_thread: threading.Thread | None = None
+        # Serializes consumer start/stop decisions with enqueue so a job is
+        # never stranded in the queue by a consumer exiting between put() and
+        # _ensure_job_thread() (TOCTOU on is_alive()).
+        self._job_lock = threading.Lock()
 
         # Threading synchronization for alignment model prompt
         self._alignment_event = threading.Event()
@@ -700,19 +704,24 @@ class MeetRecorderWindow(Gtk.Window):
         if not self._label_audio_path or not confirmed_label_map:
             return
         try:
-            # We need the original (pre-relabel) segments, stored on the transcript
-            # that was passed to _do_label_speakers.  Retrieve from the saved JSON.
-            from millet.label import _find_session_files, _load_transcript
+            # Use the in-memory pre-relabel segments (original speaker ids)
+            # captured in _do_label_speakers_bg.  confirmed_label_map is keyed
+            # by original id, so matching against the already-relabeled JSON on
+            # disk would find nothing (and race with the job thread's save).
             from millet.voiceprint import update_profiles_from_confirmed_labels
 
-            files = _find_session_files(self._label_audio_path.parent)
-            transcript_json = files.get("json")
-            if not transcript_json or not transcript_json.exists():
-                return
-            transcript = _load_transcript(transcript_json)
+            pre_relabel = getattr(self, "_label_pre_relabel_segments", None)
+            if not pre_relabel:
+                from millet.label import _find_session_files, _load_transcript
+
+                files = _find_session_files(self._label_audio_path.parent)
+                transcript_json = files.get("json")
+                if not transcript_json or not transcript_json.exists():
+                    return
+                pre_relabel = _load_transcript(transcript_json).segments
             update_profiles_from_confirmed_labels(
                 self._label_audio_path,
-                transcript.segments,
+                pre_relabel,
                 confirmed_label_map,
                 self._label_channel_map,
             )
@@ -948,13 +957,14 @@ class MeetRecorderWindow(Gtk.Window):
 
     def _ensure_job_thread(self):
         """Start the job consumer thread if it's not already running."""
-        if self._job_thread is None or not self._job_thread.is_alive():
-            self._job_thread = threading.Thread(
-                target=self._job_consumer,
-                name="meet-bg-jobs",
-                daemon=True,
-            )
-            self._job_thread.start()
+        with self._job_lock:
+            if self._job_thread is None or not self._job_thread.is_alive():
+                self._job_thread = threading.Thread(
+                    target=self._job_consumer,
+                    name="meet-bg-jobs",
+                    daemon=True,
+                )
+                self._job_thread.start()
 
     def _job_consumer(self):
         """Long-lived thread that processes post-recording jobs sequentially."""
@@ -962,8 +972,19 @@ class MeetRecorderWindow(Gtk.Window):
             try:
                 output = self._job_queue.get(timeout=1.0)
             except queue.Empty:
-                # No more jobs — exit the thread (will be restarted if needed)
-                return
+                # No more jobs — exit the thread (will be restarted if needed).
+                # Take the lock and re-check emptiness so we never exit while a
+                # job was enqueued concurrently: _ensure_job_thread holds the
+                # same lock and sees is_alive() True only until we clear it here.
+                with self._job_lock:
+                    if self._job_queue.empty():
+                        # Mark ourselves gone while holding the lock so a
+                        # concurrent _ensure_job_thread reliably starts a
+                        # fresh consumer instead of trusting a stale
+                        # is_alive() on this exiting thread.
+                        self._job_thread = None
+                        return
+                    continue
 
             session_name = output.parent.name
             try:
@@ -1242,6 +1263,11 @@ class MeetRecorderWindow(Gtk.Window):
                 self._label_auto_matches = auto_matches
                 self._label_channel_map = channel_map
                 self._label_audio_path = wav_path
+                # Snapshot pre-relabel segments (original speaker ids) so the
+                # background profile update matches by id.  Reloading the JSON
+                # in _update_voice_profiles would race with the relabeled save
+                # below and match nothing.
+                self._label_pre_relabel_segments = list(transcript.segments)
 
                 GLib.idle_add(
                     self._set_bg_status, f"{session_name}: labeling speakers..."

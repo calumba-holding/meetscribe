@@ -1,5 +1,86 @@
 # Changelog
 
+## v0.14.0 — codebase review: correctness, security, and efficiency fixes
+
+A broad review pass across the pipeline fixing correctness bugs (several of
+which silently produced wrong output), hardening the git-based sync path, and
+cutting redundant full-file audio decodes on the labeling hot path. Also a
+large README accuracy sweep. Focused CI suite grows to 399 passing tests.
+
+### Fixed — correctness
+
+* **`millet/transcribe.py`** — `_seg_channel_ratio` now guards `start_t is
+  None`. WhisperX alignment routinely emits words without timestamps; the mono
+  channel-correction path had no try/except, so a single such word crashed the
+  entire transcription *after* ASR completed, and on the dual-diarize path it
+  silently disabled mic-bleed correction.
+* **`millet/cli/label.py`, `millet/gui.py`** — voiceprint profile updates now
+  match against the **pre-relabel** segments (snapshotted before `apply_labels`
+  rewrites the transcript). Previously the id-keyed update matched nothing
+  after relabeling and silently no-op'd while printing "Voice profiles
+  updated." The GUI path also no longer races the job thread's re-save.
+* **`millet/summarize.py`** — the fallback chain no longer forces the user's
+  `MILLET_SUMMARY_MODEL` onto a *different* fallback backend (which guaranteed
+  a failed chain); each fallback backend uses its own default model.
+  Availability probes now carry the caller's `ollama_url`, so a custom Ollama
+  server is no longer reported unavailable.
+* **`millet/transcribe.py`** — a failed/absent language detection now yields
+  `decode_lang=None` (backend auto-detects) or the operator default, instead of
+  forcing an English decode of a non-English meeting.
+* **`millet/gui.py`** — closed a TOCTOU in `_ensure_job_thread`/`_job_consumer`
+  that could strand a queued recording when the consumer exited between
+  `put()` and the `is_alive()` check.
+* **`millet/cli/run.py`** — a preset summary failure now writes the PDF first
+  and exits non-zero, matching `transcribe` (previously a raw traceback with no
+  PDF).
+* **`millet/cli/download.py`** — exits non-zero when any requested download
+  fails (was exit 0).
+* **`millet/cli/translate.py`** — sizes `num_ctx` to fit the full transcript
+  plus translation output; the fixed `num_ctx=8192` silently truncated typical
+  45–105 min meetings.
+* Smaller fixes: version-fallback import in `cli/_helpers.py`; `sync.py`
+  `load_sync_config` returns a copy (not the shared mutable default);
+  `apply_labels` merges `speaker_labels` instead of overwriting; tempfile
+  cleanup on ffmpeg failure and a clip fd leak; `parakeet` cache check keyed by
+  the requested model; RTL reshaping applied before XML-escaping in PDFs
+  (fixes scrambled entities in Farsi output); a rewritten trailing-JSON scan in
+  `frontmatter.py` that no longer discards valid data when the body contains an
+  earlier `{`.
+
+### Fixed — security
+
+* **`millet/sync.py`** — `git clone` now validates `repo_url`: rejects
+  option-looking values (leading `-`, e.g. `--upload-pack=`) and unsafe git
+  transports (`ext::` …), allows only https/ssh/git/file/local paths, and uses
+  a `--` separator. `_repo_name_from_url` is sanitized so a hostile URL cannot
+  traverse out of the clone base directory.
+
+### Changed — efficiency
+
+* **`millet/voiceprint.py`** — a per-file channel-decode cache eliminates the N
+  redundant full-file ffmpeg decodes (one per speaker) in the identify / enroll
+  / profile-update loops.
+* **`millet/label.py`** — `extract_speaker_clip` seek-decodes only the ~8 s clip
+  window (`ffmpeg -ss/-t`) instead of decoding the whole file per speaker.
+
+### Documentation
+
+* README accuracy sweep: corrected the `--mixdown` default (`dual-diarize`),
+  the recordings directory (`~/meet-recordings`), the `meet` → `millet` command
+  rename, `MEETSCRIBE_*` → `MILLET_*` env vars, the prompt path, and the
+  `--asr-backend` / `--summary-backend` choice lists. Added docs for the
+  `download` and `translate` commands, the Parakeet backend, dual-diarize
+  tuning flags, `label` power flags, team-scoped enroll/sync, a
+  configuration/env-var reference, and offline mode. Fixed the stale
+  `summarize.py` module docstring.
+
+### Tests
+
+* New regressions: `_seg_channel_ratio` None-guard and the
+  detection-unavailable language path (`tests/test_transcribe.py`); fallback
+  model resolution (`tests/test_summarize_twopass.py`); trailing-JSON recovery
+  despite an earlier brace line (`tests/test_frontmatter.py`).
+
 ## v0.13.3 — voiceprint many-to-one fold no longer merges two people
 
 The `--auto` labeler could silently attribute one person's turns to a
