@@ -700,22 +700,27 @@ def apply_labels(
         fm_dict, body = parse_frontmatter_block(raw)
 
         def _replace_all(s: str) -> str:
-            # Longest label first with word boundaries: naive substring
-            # replacement in dict order corrupted overlapping labels
-            # (relabeling REMOTE before REMOTE_1 turned "REMOTE_1" into
-            # "Alice_1"; SPEAKER_1 clobbered the prefix of SPEAKER_10)
-            # and short labels like "YOU" matched uppercase prose.
+            # Single-pass alternation so each source position is rewritten
+            # exactly once from the ORIGINAL text.  Sequential per-key
+            # re.sub chained on the same string, which corrupted a SWAP:
+            # {"Alaaddin":"Kemal","Kemal":"Alaaddin"} first turned every
+            # "Alaaddin" into "Kemal", then the second pass re-caught those
+            # just-written "Kemal"s and collapsed BOTH speakers to one name.
+            # Alternation is sorted longest-first so overlapping labels match
+            # the longer one (REMOTE_1 before REMOTE; SPEAKER_10 before
+            # SPEAKER_1).  \b guards short labels like "YOU" from prose.
             import re as _re
 
-            for old_label, new_label in sorted(
-                label_map.items(), key=lambda kv: len(kv[0]), reverse=True
-            ):
-                # Callable repl: new_label is inserted literally (no
-                # backreference/escape interpretation).
-                s = _re.sub(
-                    rf"\b{_re.escape(old_label)}\b", lambda _m, nl=new_label: nl, s
-                )
-            return s
+            if not label_map:
+                return s
+            keys = sorted(label_map, key=len, reverse=True)
+            pattern = _re.compile(
+                r"\b(?:" + "|".join(_re.escape(k) for k in keys) + r")\b"
+            )
+            # Callable repl: value inserted literally (no backreference
+            # interpretation).  Each match resolves against the original map,
+            # never against a previously-substituted value.
+            return pattern.sub(lambda m: label_map[m.group(0)], s)
 
         body = _replace_all(body)
 

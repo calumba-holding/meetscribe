@@ -454,6 +454,41 @@ class TestApplyLabels:
         assert "Alice_1" not in new_text
         assert "Alice_2" not in new_text
 
+    def test_find_replace_summary_swap(self, session_dir):
+        """A swap {A:B, B:A} must swap, not collapse both to one name.
+
+        Regression: sequential per-key re.sub chained on the same string —
+        replacing Alaaddin->Kemal first, then Kemal->Alaaddin re-caught the
+        just-written Kemals and collapsed BOTH speakers to a single name in
+        the summary/frontmatter/PDF. The relabel must be a single atomic pass.
+        """
+        summary_path = session_dir / "meeting-20260314-100000.summary.md"
+        summary_path.write_text(
+            "Alaaddin opened. Kemal replied. Alaaddin closed.\n"
+        )
+        apply_labels(
+            session_dir,
+            {"Alaaddin": "Kemal", "Kemal": "Alaaddin"},
+            regenerate_summary=False,
+        )
+        new_text = summary_path.read_text()
+        assert "Kemal opened." in new_text
+        assert "Alaaddin replied." in new_text
+        assert "Kemal closed." in new_text
+
+    def test_find_replace_summary_chain_single_pass(self, session_dir):
+        """{A:B, B:C} must not chain A->B->C: each source position is
+        rewritten exactly once from the original text."""
+        summary_path = session_dir / "meeting-20260314-100000.summary.md"
+        summary_path.write_text("Ann met Bob.\n")
+        apply_labels(
+            session_dir,
+            {"Ann": "Bob", "Bob": "Cara"},
+            regenerate_summary=False,
+        )
+        new_text = summary_path.read_text()
+        assert new_text.strip() == "Bob met Cara."
+
     def test_find_replace_summary_word_boundary(self, session_dir):
         """A label must only match as a whole word — 'YOU' must not fire
         inside 'YOUR' (uppercase prose)."""

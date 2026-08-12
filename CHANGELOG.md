@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.14.1 — fix: speaker relabel swap collapsed both speakers to one name
+
+### Fixed — correctness
+
+* **`millet/label.py`** — `apply_labels(..., regenerate_summary=False)` (the
+  fast find-and-replace path used by vezir's TUI relabel) now applies the
+  label map in a **single atomic pass**. The old `_replace_all` chained one
+  `re.sub` per key over the same string, so a **swap**
+  `{"Alaaddin":"Kemal","Kemal":"Alaaddin"}` first turned every "Alaaddin"
+  into "Kemal", then the second pass re-caught those just-written "Kemal"s
+  and collapsed **both** speakers to a single name — in the summary body, the
+  structured frontmatter sidecar (participants/assignees/decisions), and the
+  regenerated PDF's summary section. Replacement is now a single
+  longest-match-first alternation regex resolved against the original map, so
+  a cyclic swap `{A:B,B:A}` and a chain `{A:B,B:C}` both apply correctly. The
+  transcript path (`relabel_transcript_in_memory`) was already single-pass and
+  is unchanged. Focused CI suite grows to 401 passing tests.
+
 ## v0.14.0 — codebase review: correctness, security, and efficiency fixes
 
 A broad review pass across the pipeline fixing correctness bugs (several of
