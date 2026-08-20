@@ -1147,6 +1147,19 @@ def _summarize_claudemax(
 # ─── Generic OpenAI-compatible backend ────────────────────────────────────
 
 
+# Kimi K-series reasoning models (kimi-k2, kimi-k3, kimi-for-coding, ...)
+# reject any sampling temperature other than 1 with HTTP 400
+# "invalid temperature: only 1 is allowed for this model".
+_KIMI_KSERIES_RE = re.compile(r"kimi-(k\d+|for-coding)", re.IGNORECASE)
+
+
+def _effective_temperature(model: str, temperature: float) -> float:
+    """Clamp temperature for models with a fixed-temperature server side."""
+    if _KIMI_KSERIES_RE.search(model or ""):
+        return 1.0
+    return temperature
+
+
 def _summarize_openai(
     system_prompt: str,
     user_prompt: str,
@@ -1194,7 +1207,7 @@ def _summarize_openai(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=config.temperature,
+            temperature=_effective_temperature(config.model, config.temperature),
             timeout=config.timeout,
         )
     except Exception as e:

@@ -17,6 +17,7 @@ from millet.summarize import (
     MeetingSummary,
     SummaryConfig,
     _default_model_for_backend,
+    _effective_temperature,
     _preset_fallback_allowed,
     _resolve_fallback_order,
     summarize,
@@ -177,6 +178,19 @@ class TestSummarizePresetFallback:
         assert result.backend == "claudemax"
         assert result.preset == "high-quality"
         assert result.fallback_used is False
+
+
+# ─── Kimi K-series temperature clamp ───────────────────────────────────────
+
+
+class TestEffectiveTemperature:
+    @pytest.mark.parametrize("model", ["kimi-k3", "kimi-k2.6", "kimi-for-coding", "Kimi-K3"])
+    def test_kimi_kseries_forced_to_1(self, model):
+        assert _effective_temperature(model, 0.3) == 1.0
+
+    @pytest.mark.parametrize("model", ["gpt-4o-mini", "moonshot-v1-8k", "k3", "glm-5-2"])
+    def test_other_models_keep_configured(self, model):
+        assert _effective_temperature(model, 0.3) == 0.3
 
 
 # ─── Meta sidecar provenance ───────────────────────────────────────────────

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.16.1 — fix: Kimi K-series temperature clamp on the openai backend
+
+### Fixed
+
+* **`millet/summarize.py`** — calling a Kimi K-series reasoning model
+  (`kimi-k2*`, `kimi-k3`, `kimi-for-coding`) through the generic
+  OpenAI-compatible backend failed with HTTP 400 "invalid temperature:
+  only 1 is allowed for this model", because the default summary
+  temperature is 0.3.  New `_effective_temperature()` clamps the request
+  temperature to 1.0 for `kimi-(k\d+|for-coding)` model names; all other
+  models keep the configured temperature.  This unblocks the
+  Claude-Max→Kimi K3 fallback path (`api.kimi.com/coding/v1`).
+  8 new parametrized tests.
+
 ## v0.16.0 — feat: opt-in preset fallback (e.g. Claude Max exhausted → Kimi)
 
 ### Added
