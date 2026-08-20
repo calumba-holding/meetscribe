@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.16.0 — feat: opt-in preset fallback (e.g. Claude Max exhausted → Kimi)
+
+### Added
+
+* **`millet/summarize.py`** — three operator-level env knobs that let an
+  explicitly requested summarization preset degrade gracefully instead of
+  hard-failing, aimed at self-hosted servers whose primary backend has
+  occasional outages (e.g. a Claude Max subscription running out):
+
+  * `MILLET_SUMMARY_PRESET_FALLBACK=1` — when a non-`confidential` preset's
+    backend fails or is unavailable, continue down the fallback chain
+    instead of re-raising. Every fallback attempt is logged via the
+    progress callback. The **`confidential` preset never falls back** —
+    a silent tinfoil→cloud fallback would defeat the privacy contract,
+    so it stays fail-loud regardless of this setting.
+  * `MILLET_SUMMARY_FALLBACK_ORDER` — comma-separated override of the
+    fallback chain (default unchanged: `claudemax,tinfoil,openrouter,
+    ollama`). This is how the generic `openai` backend joins the chain,
+    e.g. `MILLET_SUMMARY_FALLBACK_ORDER=openai`. Availability gating
+    still applies, so listing a backend that isn't configured is a no-op.
+  * `MILLET_OPENAI_MODEL` — per-backend default model for the generic
+    OpenAI-compatible backend (e.g. `kimi-k3` for
+    `https://api.moonshot.ai/v1`). Previously a fallback into `openai`
+    would have used the hardcoded `gpt-4o-mini` default. The chain-wide
+    `MILLET_SUMMARY_MODEL` is still deliberately ignored for fallback
+    backends.
+
+* **`.summary.meta.json` sidecar** now records provenance: `"preset"`
+  (the requested preset, or `null`) and `"fallback_used"` (true when the
+  winning backend differs from the configured one). Downstream consumers
+  (vezir) read this to display "summarized via fallback" instead of
+  silently presenting a fallback summary as if the requested preset ran.
+
+### Tests
+
+* New `tests/test_summarize_preset_fallback.py` (24 tests): fallback-order
+  parsing, `MILLET_OPENAI_MODEL` resolution (and continued
+  `MILLET_SUMMARY_MODEL` isolation), the preset-fallback gate truth table,
+  dispatch behavior with mocked backends (fires when enabled, raises by
+  default, `confidential` never falls back, primary-unavailable path,
+  all-backends-failed path, result tagging), and meta sidecar provenance.
+
 ## v0.15.1 — fix: two-pass extraction truncated on thinking-heavy models
 
 ### Fixed — correctness
